@@ -397,6 +397,8 @@ static int JAEventState(id vc) {
 static void JADumpRecordFiles(id vc, NSString *tag);
 static NSString *JAKVC(id obj, NSString *key);
 static void JADumpEventFields(id e);
+static void JADumpEverything(id vc, NSString *tag);
+static void JAInstallProbes(void);
 
 static void JASwitchDay(id vc, long long sec) {
     long long dayStart = JADayStartSec(@(sec));
@@ -490,6 +492,7 @@ static void JASwitchDay(id vc, long long sec) {
             JADumpEventFields(evs[0]);
             if (evs.count > 1) JADumpEventFields(evs.lastObject);
         }
+        JADumpEverything(vc, @"切日后2s");
     });
 
     @try { [vc setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"]; }
@@ -767,6 +770,7 @@ static void JASeekExact(id vc, long long sec, int attempt) {
         if (cur >= 0 && diff <= 90) {
             JALog(@"seek 到位 curSec=%lld 目标=%lld (第 %d 次)", cur, rel, attempt);
             JATimeLineSync(vc, sec);
+            JADumpEverything(vc, @"seek后");
             return;
         }
         if (attempt >= 3) {
@@ -1122,9 +1126,172 @@ static void JAHook(void) {
             }
             g_rtcHooked = YES;
             JALog(@"v1.50 SD 播放器 hooks 已装");
+            JAInstallProbes();
         }
     }
 }
+
+// ================= v1.55 全量诊断 =================
+// 目的：一次装包把所有可能定位问题的实数都拿到，不再一轮一轮试。
+
+// 递归打印对象所有 ivar 的「名字 + 值」
+static void JADumpAllIvars(id o, NSString *tag) {
+    if (!o) { JALog(@"[%@] nil", tag); return; }
+    Class cls = object_getClass(o);
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(cls, &n);
+    NSMutableString *s = [NSMutableString stringWithFormat:@"[%@] %@ (%u 字段): ", tag,
+                          NSStringFromClass(cls), n];
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = ivar_getName(ivars[i]);
+        if (!nm) continue;
+        NSString *key = [NSString stringWithUTF8String:nm];
+        if ([key hasPrefix:@"_"]) key = [key substringFromIndex:1];
+        NSString *val = @"?";
+        @try {
+            id v = [o valueForKey:key];
+            if (!v) val = @"nil";
+            else if ([v isKindOfClass:NSNumber.class]) val = [v description];
+            else if ([v isKindOfClass:NSString.class]) {
+                val = [v length] > 30 ? [[v substringToIndex:30] stringByAppendingString:@"~"] : v;
+            } else {
+                NSString *d = [v description];
+                val = ([d containsString:@"Block"] || [d containsString:@"block"])
+                      ? @"<block>" : ([d length] > 30 ? [[d substringToIndex:30] stringByAppendingString:@"~"] : d);
+            }
+        } @catch (__unused NSException *e) { val = @"KVC异常"; }
+        [s appendFormat:@"%s=%@ | ", nm, val];
+    }
+    if (ivars) free(ivars);
+    JALog(@"%@", s);
+}
+
+// 扫描全类，找某个 selector 到底挂在哪个类上
+static void JAFindSelectorOwner(NSString *selStr) {
+    SEL sel = NSSelectorFromString(selStr);
+    int total = objc_getClassList(NULL, 0);
+    if (total <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)total);
+    if (!classes) return;
+    total = objc_getClassList(classes, total);
+    NSMutableString *hits = [NSMutableString string];
+    for (int i = 0; i < total; i++) {
+        Class c = classes[i];
+        if (!c) continue;
+        const char *cn = class_getName(c);
+        if (!cn) continue;
+        // 只看乔安自己的类，跳过系统类，省时间也防误伤
+        if (strncmp(cn, "JA", 2) != 0 && strncmp(cn, "MY", 2) != 0) continue;
+        if (class_getInstanceMethod(c, sel)) {
+            if (hits.length > 200) { [hits appendString:@"..."]; break; }
+            [hits appendFormat:@"%@ ", NSStringFromClass(c)];
+        }
+    }
+    free(classes);
+    JALog(@"selector %@ 所属类: %@", selStr, hits.length ? hits : @"(未找到)");
+}
+
+// ---------- probe hooks：只记录调用，不改行为 ----------
+static IMP g_p_switchDay = NULL, g_p_loadRec = NULL, g_p_startSD = NULL, g_p_seekTo = NULL;
+static IMP g_p_vmSeek = NULL, g_p_vmSelDay = NULL, g_p_setEnterSD = NULL;
+static IMP g_p_setCtrl = NULL, g_p_setSeek = NULL, g_p_tlChange = NULL;
+
+static void p_switchDay(id self, SEL _cmd, long long day, id ds) {
+    JALog(@">>> HOOK switchToSDDay day=%lld date=%@", day, ds);
+    if (g_p_switchDay) ((void (*)(id, SEL, long long, id))g_p_switchDay)(self, _cmd, day, ds);
+}
+static void p_loadRec(id self, SEL _cmd, long long day) {
+    JALog(@">>> HOOK loadRecordList day=%lld 类型=%lld", day, day);
+    if (g_p_loadRec) ((void (*)(id, SEL, long long))g_p_loadRec)(self, _cmd, day);
+}
+static void p_startSD(id self, SEL _cmd, long long ts) {
+    JALog(@">>> HOOK startSDPlayWithSelectTimeStamp ts=%lld", ts);
+    if (g_p_startSD) ((void (*)(id, SEL, long long))g_p_startSD)(self, _cmd, ts);
+}
+static void p_seekTo(id self, SEL _cmd, long long pos, double dur) {
+    JALog(@">>> HOOK seekTo pos=%lld dur=%.1f", pos, dur);
+    if (g_p_seekTo) ((void (*)(id, SEL, long long, double))g_p_seekTo)(self, _cmd, pos, dur);
+}
+static void p_vmSeek(id self, SEL _cmd, long long ts) {
+    JALog(@">>> HOOK vm seekSDPlay ts=%lld", ts);
+    if (g_p_vmSeek) ((void (*)(id, SEL, long long))g_p_vmSeek)(self, _cmd, ts);
+}
+static id p_vmSelDay(id self, SEL _cmd, long long itv) {
+    id r = nil;
+    if (g_p_vmSelDay) r = ((id (*)(id, SEL, long long))g_p_vmSelDay)(self, _cmd, itv);
+    JALog(@">>> HOOK vm sdSelectiontDay itv=%lld 返回=%@", itv, r);
+    return r;
+}
+static void p_setEnterSD(id self, SEL _cmd, BOOL v) {
+    JALog(@">>> HOOK setIsEnterSDPlay=%d", (int)v);
+    if (g_p_setEnterSD) ((void (*)(id, SEL, BOOL))g_p_setEnterSD)(self, _cmd, v);
+}
+static void p_setCtrl(id self, SEL _cmd, int v) {
+    JALog(@">>> HOOK setSdplayControl=%d", v);
+    if (g_p_setCtrl) ((void (*)(id, SEL, int))g_p_setCtrl)(self, _cmd, v);
+}
+static void p_setSeek(id self, SEL _cmd, BOOL v) {
+    JALog(@">>> HOOK setIsSeekingPlay=%d", (int)v);
+    if (g_p_setSeek) ((void (*)(id, SEL, BOOL))g_p_setSeek)(self, _cmd, v);
+}
+static void p_tlChange(id self, SEL _cmd, long long v) {
+    JALog(@">>> HOOK timeLine changeCurrentTimeStamp=%lld", v);
+    if (g_p_tlChange) ((void (*)(id, SEL, long long))g_p_tlChange)(self, _cmd, v);
+}
+
+static void JAInstallProbes(void) {
+    Class vc = NSClassFromString(@"JANewRtcSDPlayViewController");
+    Class vm = NSClassFromString(@"JANewRtcSDPlayViewModel");
+    Class tl = NSClassFromString(@"JATimeLineView");
+    if (vc) {
+        JASetImp(vc, NSSelectorFromString(@"switchToSDDay:dateString:"), (IMP)p_switchDay, &g_p_switchDay);
+        JASetImp(vc, NSSelectorFromString(@"loadRecordListWithSelectiontDay:"), (IMP)p_loadRec, &g_p_loadRec);
+        JASetImp(vc, NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:"), (IMP)p_startSD, &g_p_startSD);
+        JASetImp(vc, NSSelectorFromString(@"seekTo:duration:"), (IMP)p_seekTo, &g_p_seekTo);
+    }
+    if (vm) {
+        JASetImp(vm, NSSelectorFromString(@"seekSDPlayWithSelectTimeStamp:"), (IMP)p_vmSeek, &g_p_vmSeek);
+        JASetImp(vm, NSSelectorFromString(@"sdSelectiontDayWithTimeInterval:"), (IMP)p_vmSelDay, &g_p_vmSelDay);
+        JASetImp(vm, NSSelectorFromString(@"setIsEnterSDPlay:"), (IMP)p_setEnterSD, &g_p_setEnterSD);
+        JASetImp(vm, NSSelectorFromString(@"setSdplayControl:"), (IMP)p_setCtrl, &g_p_setCtrl);
+        JASetImp(vm, NSSelectorFromString(@"setIsSeekingPlay:"), (IMP)p_setSeek, &g_p_setSeek);
+    }
+    if (tl) {
+        JASetImp(tl, NSSelectorFromString(@"changeCurrentTimeStamp:"), (IMP)p_tlChange, &g_p_tlChange);
+    }
+    JALog(@"v1.55 probes 已装 vc=%d vm=%d tl=%d", vc != nil, vm != nil, tl != nil);
+
+    JAFindSelectorOwner(@"reloadTimeLineWithsdSelectiontDay:timePaintingArray:reloadType:");
+    JAFindSelectorOwner(@"getCurrentEventWithTimeStamp:");
+    JAFindSelectorOwner(@"loadRecordListWithSelectiontDay:");
+    JAFindSelectorOwner(@"refreshCurrentSelectedDayAfterReturn");
+    JAFindSelectorOwner(@"deviceSDScrollToTimeNoneVideo");
+    JAFindSelectorOwner(@"sdSelectiontDayWithTimeInterval:");
+}
+
+// 一次把 VC / viewModel / timeLineView / 事件 全打出来
+static void JADumpEverything(id vc, NSString *tag) {
+    if (!vc) return;
+    JADumpAllIvars(vc, [tag stringByAppendingString:@".VC"]);
+    id vm = nil;
+    @try { vm = [vc valueForKey:@"viewModel"]; } @catch (__unused NSException *e) {}
+    if (vm) JADumpAllIvars(vm, [tag stringByAppendingString:@".VM"]);
+    id tl = nil;
+    @try { tl = [vc valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
+    if (tl) JADumpAllIvars(tl, [tag stringByAppendingString:@".TL"]);
+    id cam = nil;
+    @try { cam = [vc valueForKey:@"myCamera"]; } @catch (__unused NSException *e) {}
+    if (cam) JALog(@"[%@.CAM] sdSelectiontDay=%@", tag, JAKVC(cam, @"sdSelectiontDay"));
+    NSArray *evs = nil;
+    @try { evs = [vc valueForKey:@"sdRecordFileArr"]; } @catch (__unused NSException *e) {}
+    if ([evs isKindOfClass:NSArray.class] && evs.count > 0) {
+        JALog(@"[%@.事件] 共 %lu 条", tag, (unsigned long)evs.count);
+        JADumpEventFields(evs[0]);
+        JADumpEventFields(evs.lastObject);
+    }
+}
+
+// ================= v1.55 全量诊断结束 =================
 
 __attribute__((constructor))
 static void JASDReplayInit(void) {
