@@ -595,32 +595,28 @@ static void JADoLocate(id vc, long long sec, int state) {
         }
     });
 
-    // 官方在流上下文未就绪时会静默丢弃定位，之后又会在重建流时把位置推回「最新」。
-    // 所以不能无条件发 3 次 —— 第 3 次会把第 2 次已经成功的位置推回 12:46。
-    // 改为：1.2s 后读播放流真实位置(currentTimeStamp)，到位就停，没到位才重试。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+    // 关键：currentTimeStamp 是「实时/设备当前时间」，不是播放位置，不能用来判成败。
+    // 唯一的成功信号是 viewModel 的 isEnterSDPlay 从 0 变 1 —— 说明这一次调用
+    // 真的把官方带进了 SD 模式并完成了定位。
+    // 若 1.5s 后仍是 0，说明这次只完成了「点火」、定位被吞，才补发第 2 次。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (vc != g_activeSDPlayer) return;
-        if (JAStreamAt(vc, sec)) {
-            JALog(@"定位成功，流位置已在目标 (%d 次)", g_locateCount);
+        if (JASDReady(vc)) {
+            JALog(@"进入SD=1，定位已生效 (%d 次)", g_locateCount);
             return;
         }
-
-        long long cur = JAStreamValue(vc);
-        if (cur <= 0) {
-            // 时间戳收到了、SD 模式也进了，但播放位置还是 0 —— 流没起来，踢一下
-            JALog(@"流未启动(curTS=%lld)，踢流 (%d 次)", cur, g_locateCount);
-            JAKickStart(vc);
-        }
-
         if (g_locateCount >= 2) {
-            JALog(@"定位失败，2 次已用完(curTS=%lld)", cur);
+            JALog(@"仍是进入SD=0，2 次已用完");
             return;
         }
-        JALog(@"定位未生效，重试（已用 %d 次）", g_locateCount);
+        JALog(@"进入SD 仍为 0，第 1 次被吞，补发 (%d 次)", g_locateCount);
         JADoLocate(vc, sec, 2);
     });
 }
+
+// 前向声明
+static BOOL JASDReady(id vc);
 
 // viewModel 的 isEnterSDPlay —— 官方是否真的进入了 SD 播放模式
 static BOOL JASDReady(id vc) {
@@ -636,8 +632,8 @@ static BOOL JASDReady(id vc) {
 static void JAPollReady(id vc, long long sec, int attempt) {
     if (vc != g_activeSDPlayer || g_located) return;
 
-    if (JASDReady(vc) || attempt >= 10) {
-        JALog(@"SD 就绪(%d 次等待)，发定位", attempt);
+    if (JASDReady(vc) || attempt >= 5) {
+        JALog(@"SD 就绪等待=%d 次，发定位", attempt);
         JADoLocate(vc, sec, 1);
         return;
     }
