@@ -1,9 +1,0 @@
-Package: com.joolink.probe
-Name: Joolink 探针
-Version: 1.0
-Architecture: iphoneos-arm64
-Description: 只读观测：记录 Flutter 通道出入参、原生网络请求、越狱路径查询，用于定位回放无录像问题
-Maintainer: local
-Author: local
-Section: Tweaks
-Depends: firmware (>= 15.0), ellekit
