@@ -303,6 +303,7 @@ static IMP g_orig_rtc_reload = NULL;
 static BOOL g_eventsReady = NO;   // 官方 reload 回调已给出目标日数据
 static long long g_rtcTargetSec = 0;
 static unsigned long long g_rtcVdaGen = 0;
+static BOOL g_daySwitched = NO;   // viewDidLoad 阶段已经切过日，viewDidAppear 不再重复
 static BOOL g_located = NO;   // 已发过定位（保留给旧的判断用）
 static int  g_locateCount = 0; // 本次进入已发出的定位次数（最多 2 次）
 static double g_t0 = 0;       // 本次 push 的时刻，用于算耗时
@@ -531,6 +532,7 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     g_located = NO;
     g_locateCount = 0;
     g_eventsReady = NO;
+    g_daySwitched = NO;
     g_rtcVdaGen = 0;
     JALog(@"=== 进入回放 设备uid=%@ name=%@ | 创建方式=%@ ===",
           JAVal(cam, @"uid") ?: @"?",
@@ -587,6 +589,7 @@ static void ja_rtc_viewDidLoad(id self, SEL _cmd) {
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || g_located) return;
         JALog(@"viewDidLoad 阶段切日 → 秒=%lld (+%.3fs)", sec, JAElapsed());
+        g_daySwitched = YES;
         JASwitchDay(self, sec);
         JAPollEvents(self, sec, 0);
     });
@@ -601,10 +604,13 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     unsigned long long myGen = ++g_rtcVdaGen;
 
     // 兜底：viewDidLoad 阶段没赶上（hook 晚装/官方走了别的路径）时再补一次
+    // 已经切过日就不重复 —— 二次切日会让官方把已加载的事件清掉重拉，反而更慢
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || g_located || myGen != g_rtcVdaGen) return;
-        JALog(@"viewDidAppear 兜底切日 → 秒=%lld", sec);
+        if (g_daySwitched) return;
+        JALog(@"viewDidAppear 兜底切日 → 秒=%lld (+%.3fs)", sec, JAElapsed());
+        g_daySwitched = YES;
         JASwitchDay(self, sec);
         JAPollEvents(self, sec, 0);
     });
@@ -752,8 +758,15 @@ static void JAHook(void) {
             JASetImp(rtcCls, @selector(viewDidLoad), (IMP)ja_rtc_viewDidLoad, &g_orig_rtc_vdl);
             JASetImp(rtcCls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
             JASetImp(rtcCls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
-            JASetImp(rtcCls, NSSelectorFromString(@"reloadTimeLineWithsdSelectiontDay:timePaintingArray:reloadType:"),
-                     (IMP)ja_rtc_reloadTimeLine, &g_orig_rtc_reload);
+
+            SEL rsel = NSSelectorFromString(@"reloadTimeLineWithsdSelectiontDay:timePaintingArray:reloadType:");
+            Method rm = class_getInstanceMethod(rtcCls, rsel);
+            if (rm) {
+                JALog(@"reloadTimeLine 存在, 类型编码=%s", method_getTypeEncoding(rm));
+                JASetImp(rtcCls, rsel, (IMP)ja_rtc_reloadTimeLine, &g_orig_rtc_reload);
+            } else {
+                JALog(@"reloadTimeLine 不在 JANewRtcSDPlayViewController 上");
+            }
             g_rtcHooked = YES;
             JALog(@"v1.33 SD 播放器 hooks 已装");
         }
