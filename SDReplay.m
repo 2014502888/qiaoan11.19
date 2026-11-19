@@ -420,6 +420,19 @@ static NSString *JAKVC(id obj, NSString *key) {
 }
 
 // 把播放器/时间轴的真实状态打出来，用来区分「指示器到位」和「播放流到位」
+// 播放流真实位置：vc.currentTimeStamp 是官方播放器的当前秒（日志实测可用），
+// 和时间轴指示器不同 —— 指示器是我们自己拨的，不能用来判断定位是否生效。
+static BOOL JAStreamAt(id vc, long long sec) {
+    id cur = nil;
+    @try { cur = [vc valueForKey:@"currentTimeStamp"]; } @catch (__unused NSException *e) {}
+    if (!cur) return NO;
+    long long v = [cur longLongValue];
+    if (v <= 0) return NO;
+    long long d = v - sec;
+    if (d < 0) d = -d;
+    return d <= 60;
+}
+
 static void JADumpState(id vc, NSString *tag) {
     if (!vc) return;
     id cam = nil;
@@ -491,16 +504,23 @@ static void JADoLocate(id vc, long long sec, int state) {
         }
     });
 
-    // 官方在流上下文未就绪时会静默丢弃定位（现象：定位没跳、返回再进才跳）。
-    // 无条件重试，最多 3 次，第三次约在 +3.1s，正是 v1.32 那个稳态窗口。
-    if (g_locateCount < 3) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (vc != g_activeSDPlayer || g_locateCount >= 3) return;
-            JALog(@"重试定位（上次可能被官方吞掉）");
-            JADoLocate(vc, sec, 2);
-        });
-    }
+    // 官方在流上下文未就绪时会静默丢弃定位，之后又会在重建流时把位置推回「最新」。
+    // 所以不能无条件发 3 次 —— 第 3 次会把第 2 次已经成功的位置推回 12:46。
+    // 改为：1.2s 后读播放流真实位置(currentTimeStamp)，到位就停，没到位才重试。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (vc != g_activeSDPlayer) return;
+        if (JAStreamAt(vc, sec)) {
+            JALog(@"定位成功，流位置已在目标 (%d 次)", g_locateCount);
+            return;
+        }
+        if (g_locateCount >= 3) {
+            JALog(@"定位失败，3 次已用完");
+            return;
+        }
+        JALog(@"定位未生效，重试（已用 %d 次）", g_locateCount);
+        JADoLocate(vc, sec, 2);
+    });
 }
 
 // 轮询事件就绪：就绪即定位，最多 20 次 × 0.3s = 6s
@@ -514,10 +534,23 @@ static void JAPollEvents(id vc, long long sec, int attempt) {
         return;
     }
     if (attempt >= 20) {
-        // 属性探测不到 + 官方 reload 回调也没等到 → 才保底
-        JALog(@"事件等待超时(6s, 未收到 reload) → 保底定位");
-        JADoLocate(vc, sec, 0);
-        return;
+        // 冷启动首次进入时时间轴可能还没初始化(curSec=0)，说明官方根本没进 SD 模式，
+        // 这时定位必然无效、只会播实时。多等一轮（最多 12s），别白白发定位。
+        long long tlSec = 0;
+        id tl = nil;
+        @try { tl = [vc valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
+        @try {
+            id v = [tl valueForKey:@"currentSec"];
+            if (v) tlSec = [v longLongValue];
+        } @catch (__unused NSException *e) {}
+
+        if (tlSec <= 0 && attempt < 40) {
+            if (attempt == 20) JALog(@"时间轴未初始化(curSec=0)，继续等到 12s");
+        } else {
+            JALog(@"事件等待超时(%d 次) → 保底定位", attempt);
+            JADoLocate(vc, sec, 0);
+            return;
+        }
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
