@@ -433,6 +433,44 @@ static BOOL JAStreamAt(id vc, long long sec) {
     return d <= 60;
 }
 
+// 把 VC 的全部 ivar / 属性名打出来（只打名字和类型，不打值），
+// 用来找到真实的「事件数组 / 播放状态 / 流上下文」字段名，不再靠猜属性。
+static void JADumpFields(id vc) {
+    if (!vc) return;
+    Class cls = object_getClass(vc);
+
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(cls, &n);
+    NSMutableString *s = [NSMutableString stringWithFormat:@"IVAR(%u): ", n];
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = ivar_getName(ivars[i]);
+        const char *tp = ivar_getTypeEncoding(ivars[i]);
+        if (nm) [s appendFormat:@"%s:%s ", nm, tp ? tp : "?"];
+    }
+    if (ivars) free(ivars);
+    JALog(@"%@", s);
+
+    unsigned int pn = 0;
+    objc_property_t *props = class_copyPropertyList(cls, &pn);
+    NSMutableString *p = [NSMutableString stringWithFormat:@"PROP(%u): ", pn];
+    for (unsigned int i = 0; i < pn; i++) {
+        const char *nm = property_getName(props[i]);
+        if (nm) [p appendFormat:@"%s ", nm];
+    }
+    if (props) free(props);
+    JALog(@"%@", p);
+
+    unsigned int mn = 0;
+    Method *ms = class_copyMethodList(cls, &mn);
+    NSMutableString *m = [NSMutableString stringWithFormat:@"METH(%u): ", mn];
+    for (unsigned int i = 0; i < mn && i < 200; i++) {
+        SEL sel = method_getName(ms[i]);
+        if (sel) [m appendFormat:@"%@ ", NSStringFromSelector(sel)];
+    }
+    if (ms) free(ms);
+    JALog(@"%@", m);
+}
+
 static void JADumpState(id vc, NSString *tag) {
     if (!vc) return;
     id cam = nil;
@@ -582,6 +620,7 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     g_eventsReady = NO;
     g_daySwitched = NO;
     g_rtcVdaGen = 0;
+    JADumpFields(vc);
     JALog(@"=== 进入回放 设备uid=%@ name=%@ | 创建方式=%@ ===",
           JAVal(cam, @"uid") ?: @"?",
           JAVal(cam, @"name") ?: @"?",
