@@ -275,15 +275,18 @@ static long long JADayStartSec(NSNumber *ts) {
 // ---------- 全局状态 ----------
 
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
+static void ja_rtc_viewDidLoad(id self, SEL _cmd);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 
 static id g_activeSDPlayer = nil;
 static BOOL g_rtcHooked = NO;
+static IMP g_orig_rtc_vdl = NULL;
 static IMP g_orig_rtc_vda = NULL;
 static IMP g_orig_rtc_vdd = NULL;
 static long long g_rtcTargetSec = 0;
 static unsigned long long g_rtcVdaGen = 0;
+static BOOL g_located = NO;   // 本次进入是否已发出定位（防重复）
 
 // ---------- 创建官方 SD 回放实例（v1.33 核心改动 ①） ----------
 
@@ -382,8 +385,10 @@ static void JASwitchDay(id vc, long long sec) {
     @catch (__unused NSException *e) {}
 }
 
-static void JADoLocate(id vc, long long sec, unsigned long long gen, int state) {
-    if (vc != g_activeSDPlayer || gen != g_rtcVdaGen) return;
+static void JADoLocate(id vc, long long sec, int state) {
+    (void)state;
+    if (vc != g_activeSDPlayer || g_located) return;
+    g_located = YES;
 
     SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
     if ([vc respondsToSelector:s]) {
@@ -395,7 +400,7 @@ static void JADoLocate(id vc, long long sec, unsigned long long gen, int state) 
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (vc != g_activeSDPlayer || gen != g_rtcVdaGen) return;
+        if (vc != g_activeSDPlayer) return;
         // 时间轴指示器拨到报警秒（相对秒）
         long long dayStart = JADayStartSec(@(sec));
         if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
@@ -414,29 +419,28 @@ static void JADoLocate(id vc, long long sec, unsigned long long gen, int state) 
 }
 
 // 轮询事件就绪：就绪即定位，最多 20 次 × 0.3s = 6s
-static void JAPollEvents(id vc, long long sec, unsigned long long gen, int attempt) {
-    if (vc != g_activeSDPlayer || gen != g_rtcVdaGen) return;
+static void JAPollEvents(id vc, long long sec, int attempt) {
+    if (vc != g_activeSDPlayer || g_located) return;
 
     int state = JAEventState(vc);
     if (state == 1) {
-        JALog(@"v1.33 事件就绪(%d 次轮询) → 定位", attempt);
-        JADoLocate(vc, sec, gen, 1);
+        JALog(@"事件就绪(%d 次轮询) → 定位", attempt);
+        JADoLocate(vc, sec, 1);
         return;
     }
     if (state == -1) {
-        // 拿不到事件数组属性 → 无法等待，直接定位（退回 v1.32 行为）
-        JALog(@"v1.33 事件数组不可见，直接定位");
-        JADoLocate(vc, sec, gen, -1);
+        JALog(@"事件数组不可见，直接定位");
+        JADoLocate(vc, sec, -1);
         return;
     }
     if (attempt >= 20) {
-        JALog(@"v1.33 事件等待超时(6s, 仍为空) → 保底定位");
-        JADoLocate(vc, sec, gen, 0);
+        JALog(@"事件等待超时(6s, 仍为空) → 保底定位");
+        JADoLocate(vc, sec, 0);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        JAPollEvents(vc, sec, gen, attempt + 1);
+        JAPollEvents(vc, sec, attempt + 1);
     });
 }
 
@@ -480,6 +484,8 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
 
     UINavigationController *nav = detailVC.navigationController;
     if (!nav) nav = JATopVC().navigationController;
+    g_located = NO;                  // 每次进入重置
+    g_rtcVdaGen = 0;
     if (nav) {
         g_activeSDPlayer = vc;
         [nav pushViewController:vc animated:YES];
@@ -495,20 +501,39 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
 static IMP g_orig_clickCloudRecordAction = NULL;
 static IMP g_orig_handleJumpToOpenCloud = NULL;
 
+// v1.34：界面加载阶段就切日 —— 官方 viewDidLoad 会把 sdSelectiontDay 覆盖成「今日」，
+// 这里立刻改回报警日，让 setupData 直接按报警日拉事件，页面出现时数据已经对，
+// 不再先播一段实时再跳（v1.32 靠 stopSDPlay 强停会打坏 isEnterSDPlay，不能用）
+static void ja_rtc_viewDidLoad(id self, SEL _cmd) {
+    if (g_orig_rtc_vdl) ((void (*)(id, SEL))g_orig_rtc_vdl)(self, _cmd);
+    if (self != g_activeSDPlayer) return;
+    long long sec = g_rtcTargetSec;
+    if (sec < 1000000000LL) return;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self != g_activeSDPlayer || g_located) return;
+        JALog(@"viewDidLoad 阶段切日 → 秒=%lld", sec);
+        JASwitchDay(self, sec);
+        JAPollEvents(self, sec, 0);
+    });
+}
+
 static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (g_orig_rtc_vda) ((void (*)(id, SEL))g_orig_rtc_vda)(self, _cmd);
-    if (self != g_activeSDPlayer) return;
+    if (self != g_activeSDPlayer || g_located) return;
     long long sec = g_rtcTargetSec;
     if (sec < 1000000000LL) return;
 
     unsigned long long myGen = ++g_rtcVdaGen;
 
-    // 1.0s 后切日（等官方 viewDidLoad/setupData 跑完），不 stopSDPlay
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+    // 兜底：viewDidLoad 阶段没赶上（hook 晚装/官方走了别的路径）时再补一次
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+        if (self != g_activeSDPlayer || g_located || myGen != g_rtcVdaGen) return;
+        JALog(@"viewDidAppear 兜底切日 → 秒=%lld", sec);
         JASwitchDay(self, sec);
-        JAPollEvents(self, sec, myGen, 0);
+        JAPollEvents(self, sec, 0);
     });
 }
 
@@ -616,6 +641,7 @@ static void JAHook(void) {
     if (!g_rtcHooked) {
         Class rtcCls = NSClassFromString(@"JANewRtcSDPlayViewController");
         if (rtcCls) {
+            JASetImp(rtcCls, @selector(viewDidLoad), (IMP)ja_rtc_viewDidLoad, &g_orig_rtc_vdl);
             JASetImp(rtcCls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
             JASetImp(rtcCls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
             g_rtcHooked = YES;
