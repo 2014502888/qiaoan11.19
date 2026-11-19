@@ -395,6 +395,7 @@ static int JAEventState(id vc) {
 // ---------- 定位 ----------
 
 static void JADumpRecordFiles(id vc, NSString *tag);
+static NSString *JAKVC(id obj, NSString *key);
 
 static void JASwitchDay(id vc, long long sec) {
     long long dayStart = JADayStartSec(@(sec));
