@@ -449,8 +449,20 @@ static void JASwitchDay(id vc, long long sec) {
             id vm2 = nil;
             @try { vm2 = [vc valueForKey:@"viewModel"]; } @catch (__unused NSException *e) {}
             if (!vm2) return;
-            @try { ((void (*)(id, SEL, long long))objc_msgSend)(vm2, sd, dayStart); }
+            // 这个接口返回 id（类型编码 @24@0:8q16），返回值很可能是「该日的时间轴数据/
+            // 修正后的时间戳」，之前我们只调用、把返回值丢了。
+            id ret = nil;
+            @try { ret = ((id (*)(id, SEL, long long))objc_msgSend)(vm2, sd, dayStart); }
             @catch (NSException *e) { JALog(@"sdSelectiontDay 异常: %@", e.reason); }
+            if ([ret isKindOfClass:NSArray.class]) {
+                NSArray *a = (NSArray *)ret;
+                JALog(@"sdSelectiontDay 返回 NSArray count=%lu 首元素=%@",
+                      (unsigned long)a.count, a.count ? NSStringFromClass([a[0] class]) : @"-");
+            } else if ([ret isKindOfClass:NSNumber.class]) {
+                JALog(@"sdSelectiontDay 返回 NSNumber=%@", ret);
+            } else {
+                JALog(@"sdSelectiontDay 返回 %@ = %@", ret ? NSStringFromClass([ret class]) : @"nil", ret);
+            }
             JALog(@"备用 sdSelectiontDayWithTimeInterval: %lld", dayStart);
         });
     } else {
