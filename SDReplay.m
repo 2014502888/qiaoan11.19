@@ -513,7 +513,9 @@ static void JADumpState(id vc, NSString *tag) {
 
 // 前向声明（JADoLocate 内部要用，必须先声明）
 static BOOL JASDReady(id vc);
-static void JASeekExact(id vc, long long sec);
+static void JASeekExact(id vc, long long sec, int attempt);
+static void JATimeLineSync(id vc, long long sec);
+static long long JATimeLineSec(id vc);
 
 static void JADoLocate(id vc, long long sec, int state) {
     (void)state;
@@ -573,7 +575,7 @@ static void JADoLocate(id vc, long long sec, int state) {
             JALog(@"进入SD=1，定位已生效 (%d 次)", g_locateCount);
             // startSDPlayWithSelectTimeStamp: 会重建流并先落「最新录像」，
             // 再调 viewModel 的 seek 精确跳目标 —— 这是纯 seek，不重建流、不花屏。
-            JASeekExact(vc, sec);
+            JASeekExact(vc, sec, 1);
             return;
         }
         if (g_locateCount >= 2) {
@@ -587,46 +589,83 @@ static void JADoLocate(id vc, long long sec, int state) {
 
 // viewModel 级精确 seek：seekSDPlayWithSelectTimeStamp: / sdSelectiontDayWithTimeInterval:
 // 只移动播放位置，不重建视频流，所以不会出现「花屏/看不清」。
-static void JASeekExact(id vc, long long sec) {
-    id vm = nil;
-    @try { vm = [vc valueForKey:@"viewModel"]; } @catch (__unused NSException *e) {}
-    if (!vm) { JALog(@"seek: viewModel 读不到"); return; }
+// 时间轴指示器当前停在的相对秒（跟随真实播放位置，不是我们拨的显示值）
+static long long JATimeLineSec(id vc) {
+    id tl = nil;
+    @try { tl = [vc valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
+    if (!tl) return -1;
+    id v = nil;
+    @try { v = [tl valueForKey:@"currentSec"]; } @catch (__unused NSException *e) {}
+    if (!v) return -1;
+    return [v longLongValue];
+}
 
-    SEL s = NSSelectorFromString(@"seekSDPlayWithSelectTimeStamp:");
-    if ([vm respondsToSelector:s]) {
-        JALog(@"viewModel seek → 秒=%lld", sec);
-        @try { ((void (*)(id, SEL, long long))objc_msgSend)(vm, s, sec); }
-        @catch (NSException *e) { JALog(@"viewModel seek 异常: %@", e.reason); }
+// 把时间轴指示器拨到目标秒（只影响显示指针）
+static void JATimeLineSync(id vc, long long sec) {
+    if (vc != g_activeSDPlayer) return;
+    long long dayStart = sec - ((sec + 28800LL) % 86400LL);
+    long long rel = sec - dayStart;
+    if (rel < 0) rel = 0;
+    if (rel > 86399) rel = 86399;
+    id tl = nil;
+    @try { tl = [vc valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
+    SEL c = NSSelectorFromString(@"changeCurrentTimeStamp:");
+    if (tl && [tl respondsToSelector:c]) {
+        @try { ((void (*)(id, SEL, long long))objc_msgSend)(tl, c, rel); }
+        @catch (__unused NSException *e) {}
+        JALog(@"时间轴指针拨到 rel=%lld (+%.3fs)", rel, JAElapsed());
+    }
+}
+
+// 纯 seek：只移动播放位置、不重建视频流，所以可以安全重试（不会花屏）。
+// 先试 VC 的 seekTo:duration:（播放器级、最直接），再试 viewModel 的 seek。
+// 每次 seek 后 1.5s 读 timeLineView.currentSec 判断是否真的到位。
+static void JASeekExact(id vc, long long sec, int attempt) {
+    if (vc != g_activeSDPlayer) return;
+
+    long long dayStart = sec - ((sec + 28800LL) % 86400LL);
+    long long rel = sec - dayStart;
+    if (rel < 0) rel = 0;
+    if (rel > 86399) rel = 86399;
+
+    SEL st = NSSelectorFromString(@"seekTo:duration:");
+    if ([vc respondsToSelector:st]) {
+        JALog(@"seekTo:duration: rel=%lld (第 %d 次)", rel, attempt);
+        @try { ((void (*)(id, SEL, long long, double))objc_msgSend)(vc, st, rel, 0.0); }
+        @catch (NSException *e) { JALog(@"seekTo 异常: %@", e.reason); }
     } else {
-        JALog(@"viewModel 无 seekSDPlayWithSelectTimeStamp:");
-        SEL s2 = NSSelectorFromString(@"seekTo:duration:");
-        if ([vc respondsToSelector:s2]) {
-            long long dayStart = sec - ((sec + 28800LL) % 86400LL);
-            long long rel = sec - dayStart;
-            if (rel < 0) rel = 0;
-            if (rel > 86399) rel = 86399;
-            JALog(@"VC seekTo:duration: → rel=%lld", rel);
-            @try { ((void (*)(id, SEL, long long, double))objc_msgSend)(vc, s2, rel, 0.0); }
-            @catch (NSException *e) { JALog(@"seekTo 异常: %@", e.reason); }
+        id vm = nil;
+        @try { vm = [vc valueForKey:@"viewModel"]; } @catch (__unused NSException *e) {}
+        SEL s = NSSelectorFromString(@"seekSDPlayWithSelectTimeStamp:");
+        if (vm && [vm respondsToSelector:s]) {
+            JALog(@"viewModel seek → 秒=%lld (第 %d 次)", sec, attempt);
+            @try { ((void (*)(id, SEL, long long))objc_msgSend)(vm, s, sec); }
+            @catch (NSException *e) { JALog(@"viewModel seek 异常: %@", e.reason); }
+        } else {
+            JALog(@"seek: 两个接口都不可用");
+            return;
         }
     }
 
-    // seek 之后官方播放会覆盖时间轴指针，等它稳定再拨一次
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (vc != g_activeSDPlayer) return;
-        long long dayStart = sec - ((sec + 28800LL) % 86400LL);
-        long long rel = sec - dayStart;
-        if (rel < 0) rel = 0;
-        if (rel > 86399) rel = 86399;
-        id tl = nil;
-        @try { tl = [vc valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
-        SEL c = NSSelectorFromString(@"changeCurrentTimeStamp:");
-        if (tl && [tl respondsToSelector:c]) {
-            @try { ((void (*)(id, SEL, long long))objc_msgSend)(tl, c, rel); }
-            @catch (__unused NSException *e) {}
-            JALog(@"seek 后时间轴再同步 rel=%lld (+%.3fs)", rel, JAElapsed());
+        long long cur = JATimeLineSec(vc);
+        long long diff = cur - rel;
+        if (diff < 0) diff = -diff;
+
+        if (cur >= 0 && diff <= 90) {
+            JALog(@"seek 到位 curSec=%lld 目标=%lld (第 %d 次)", cur, rel, attempt);
+            JATimeLineSync(vc, sec);
+            return;
         }
+        if (attempt >= 3) {
+            JALog(@"seek 3 次仍不到位 curSec=%lld 目标=%lld", cur, rel);
+            JATimeLineSync(vc, sec);
+            return;
+        }
+        JALog(@"seek 未到位 curSec=%lld 目标=%lld，重试 (第 %d 次)", cur, rel, attempt);
+        JASeekExact(vc, sec, attempt + 1);
     });
 }
 
