@@ -300,7 +300,8 @@ static IMP g_orig_rtc_vda = NULL;
 static IMP g_orig_rtc_vdd = NULL;
 static long long g_rtcTargetSec = 0;
 static unsigned long long g_rtcVdaGen = 0;
-static BOOL g_located = NO;   // 本次进入是否已发出定位（防重复）
+static BOOL g_located = NO;   // 已发过定位（保留给旧的判断用）
+static int  g_locateCount = 0; // 本次进入已发出的定位次数（最多 2 次）
 static double g_t0 = 0;       // 本次 push 的时刻，用于算耗时
 
 #define JANow() [[NSDate date] timeIntervalSinceReferenceDate]
@@ -403,9 +404,43 @@ static void JASwitchDay(id vc, long long sec) {
     @catch (__unused NSException *e) {}
 }
 
+// 读时间轴当前秒，判断是否已经到位（属性名不确定，取不到就当没到位）
+static BOOL JAAlreadyAt(id vc, long long sec) {
+    long long dayStart = JADayStartSec(@(sec));
+    if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
+    long long rel = sec - dayStart;
+    if (rel < 0) rel = 0;
+    if (rel > 86399) rel = 86399;
+
+    id tl = nil;
+    @try { tl = [vc valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
+    if (!tl) return NO;
+
+    id cur = nil;
+    @try { cur = [tl valueForKey:@"currentSec"]; } @catch (__unused NSException *e) {}
+    if (!cur) {
+        @try { cur = [tl valueForKey:@"currentTimeStamp"]; } @catch (__unused NSException *e) {}
+    }
+    if (!cur) return NO;
+
+    long long v = [cur longLongValue];
+    long long d = v - rel;
+    if (d < 0) d = -d;
+    return d <= 10;
+}
+
 static void JADoLocate(id vc, long long sec, int state) {
     (void)state;
-    if (vc != g_activeSDPlayer || g_located) return;
+    if (vc != g_activeSDPlayer) return;
+    if (g_locateCount >= 2) return;
+
+    // 第二次之前先看是否已到位，避免重复 seek 造成闪屏
+    if (g_locateCount == 1 && JAAlreadyAt(vc, sec)) {
+        JALog(@"补发前检查: 已到位，跳过");
+        return;
+    }
+
+    g_locateCount++;
     g_located = YES;
 
     SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
@@ -436,6 +471,17 @@ static void JADoLocate(id vc, long long sec, int state) {
             JALog(@"时间轴同步完成 (+%.3fs)", JAElapsed());
         }
     });
+
+    // 冷启动首次进入时官方流上下文可能还没建好，定位会被内部预检查静默丢弃
+    // （现象：定位没跳，返回再进就跳了）。首次发完 1.8s 补发一次，补前先查是否已到位。
+    if (g_locateCount == 1) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (vc != g_activeSDPlayer || g_locateCount >= 2) return;
+            JALog(@"补发定位（首次可能被官方预检查吞掉）");
+            JADoLocate(vc, sec, 2);
+        });
+    }
 }
 
 // 轮询事件就绪：就绪即定位，最多 20 次 × 0.3s = 6s
@@ -484,6 +530,7 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
 
     g_t0 = JANow();
     g_located = NO;
+    g_locateCount = 0;
     g_rtcVdaGen = 0;
     JALog(@"=== 进入回放 设备uid=%@ name=%@ | 创建方式=%@ ===",
           JAVal(cam, @"uid") ?: @"?",
