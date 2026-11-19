@@ -25,7 +25,7 @@ jobs:
           unzip -q /tmp/sdk.zip -d /tmp
           ls /tmp/sdks-master
 
-      - name: Compile dylib
+      - name: Compile dylibs
         run: |
           set -e
           SDK=$(ls -d /tmp/sdks-master/iPhoneOS*.sdk | sort -V | tail -1)
@@ -33,29 +33,34 @@ jobs:
           LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld 2>/dev/null | head -1)
           echo "LD64=$LD64"
           [ -z "$LD64" ] && LD64=/usr/bin/ld64.lld
-          clang -target arm64-apple-ios15.0 \
-                -isysroot "$SDK" \
-                -dynamiclib -fobjc-arc -fblocks \
-                -fuse-ld="$LD64" \
-                -Wl,-platform_version,ios,15.0,15.0 \
-                -Wl,-undefined,dynamic_lookup \
-                -Wl,-flat_namespace \
-                -framework Foundation -framework UIKit \
-                probe.m -o JoolinkProbe.dylib
-          ls -lh JoolinkProbe.dylib
-          file JoolinkProbe.dylib
+
+          COMMON="-target arm64-apple-ios15.0 -isysroot $SDK -dynamiclib -fobjc-arc -fblocks -fuse-ld=$LD64 -Wl,-platform_version,ios,15.0,15.0 -Wl,-undefined,dynamic_lookup -Wl,-flat_namespace -framework Foundation -framework UIKit"
+
+          clang $COMMON probe.m -o JoolinkProbe.dylib
+          clang $COMMON SDReplay.m -o JoolinkSDReplay.dylib
+
+          ls -lh JoolinkProbe.dylib JoolinkSDReplay.dylib
+          file JoolinkProbe.dylib JoolinkSDReplay.dylib
 
       - name: Pseudo-sign
         run: |
           curl -sL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64 || true
           if [ -s /tmp/ldid ]; then
             chmod +x /tmp/ldid
-            /tmp/ldid -S JoolinkProbe.dylib && echo "ldid ok" || echo "ldid failed"
+            /tmp/ldid -S JoolinkProbe.dylib && echo "probe ldid ok" || echo "probe ldid failed"
+            /tmp/ldid -S JoolinkSDReplay.dylib && echo "sdreplay ldid ok" || echo "sdreplay ldid failed"
           else
             echo "ldid unavailable, skip"
           fi
 
-      - name: Upload dylib
+      - name: Upload SDReplay
+        uses: actions/upload-artifact@v4
+        with:
+          name: JoolinkSDReplay-dylib
+          path: JoolinkSDReplay.dylib
+          if-no-files-found: error
+
+      - name: Upload Probe
         uses: actions/upload-artifact@v4
         with:
           name: JoolinkProbe-dylib
