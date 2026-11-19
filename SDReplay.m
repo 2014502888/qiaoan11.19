@@ -394,6 +394,8 @@ static int JAEventState(id vc) {
 
 // ---------- 定位 ----------
 
+static void JADumpRecordFiles(id vc, NSString *tag);
+
 static void JASwitchDay(id vc, long long sec) {
     long long dayStart = JADayStartSec(@(sec));
     if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
@@ -416,6 +418,8 @@ static void JASwitchDay(id vc, long long sec) {
     // 官方 viewDidLoad 已按今日拉过一次，这里必须显式请求报警那一天的事件。
     SEL lr = NSSelectorFromString(@"loadRecordListWithSelectiontDay:");
     if ([vc respondsToSelector:lr]) {
+        Method lm = class_getInstanceMethod(object_getClass(vc), lr);
+        JALog(@"loadRecordList 类型编码=%s", lm ? method_getTypeEncoding(lm) : "?");
         @try { ((void (*)(id, SEL, long long))objc_msgSend)(vc, lr, dayStart); }
         @catch (NSException *e) { JALog(@"loadRecordList 异常: %@", e.reason); }
         JALog(@"重拉当天事件 loadRecordListWithSelectiontDay: %lld", dayStart);
@@ -423,11 +427,45 @@ static void JASwitchDay(id vc, long long sec) {
         JALog(@"无 loadRecordListWithSelectiontDay:，尝试 loadRecordListWithType:");
         SEL lt = NSSelectorFromString(@"loadRecordListWithType:");
         if ([vc respondsToSelector:lt]) {
+            Method lm2 = class_getInstanceMethod(object_getClass(vc), lt);
+            JALog(@"loadRecordListWithType 类型编码=%s", lm2 ? method_getTypeEncoding(lm2) : "?");
             @try { ((void (*)(id, SEL, long long))objc_msgSend)(vc, lt, 0); }
             @catch (NSException *e) { JALog(@"loadRecordListWithType 异常: %@", e.reason); }
             JALog(@"重拉事件 loadRecordListWithType: 0");
         }
     }
+
+    // 备用入口：viewModel 上的 sdSelectiontDayWithTimeInterval:（名字带 TimeInterval）
+    id vmj = nil;
+    @try { vmj = [vc valueForKey:@"viewModel"]; } @catch (__unused NSException *e) {}
+    SEL sd = NSSelectorFromString(@"sdSelectiontDayWithTimeInterval:");
+    if (vmj && [vmj respondsToSelector:sd]) {
+        Method sm = class_getInstanceMethod(object_getClass(vmj), sd);
+        JALog(@"sdSelectiontDayWithTimeInterval 类型编码=%s", sm ? method_getTypeEncoding(sm) : "?");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (vc != g_activeSDPlayer) return;
+            id vm2 = nil;
+            @try { vm2 = [vc valueForKey:@"viewModel"]; } @catch (__unused NSException *e) {}
+            if (!vm2) return;
+            @try { ((void (*)(id, SEL, long long))objc_msgSend)(vm2, sd, dayStart); }
+            @catch (NSException *e) { JALog(@"sdSelectiontDay 异常: %@", e.reason); }
+            JALog(@"备用 sdSelectiontDayWithTimeInterval: %lld", dayStart);
+        });
+    } else {
+        JALog(@"viewModel 无 sdSelectiontDayWithTimeInterval:");
+    }
+
+    // 切日后 2s 打一次加载状态，看官方到底有没有进入重载流程
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (vc != g_activeSDPlayer) return;
+        JADumpRecordFiles(vc, @"切日后2s");
+        JALog(@"切日后2s 缓存列表=%@ 重载列表=%@ 选中日=%@",
+              JAKVC(vc, @"isLoadCacheEventList"),
+              JAKVC(vc, @"isReLoadNormalEventList"),
+              JAKVC(vc, @"currentSelectedSDDay"));
+    });
 
     @try { [vc setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"]; }
     @catch (__unused NSException *e) {}
