@@ -7,24 +7,39 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show toolchain
+      - name: Install toolchain
         run: |
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld curl unzip file
+          clang --version
+          ls -l /usr/bin/ld.lld /usr/lib/llvm-*/bin/ld64.lld 2>/dev/null || true
+
+      - name: Fetch iPhoneOS SDK
+        run: |
+          curl -sL -o /tmp/sdk.zip https://github.com/theos/sdks/archive/master.zip
+          unzip -q /tmp/sdk.zip -d /tmp
+          ls /tmp/sdks-master
 
       - name: Compile dylib
         run: |
           set -e
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang -isysroot "$SDK" \
-                -arch arm64 \
-                -miphoneos-version-min=15.0 \
+          SDK=$(ls -d /tmp/sdks-master/iPhoneOS*.sdk | sort -V | tail -1)
+          echo "SDK=$SDK"
+          LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld 2>/dev/null | head -1)
+          echo "LD64=$LD64"
+          [ -z "$LD64" ] && LD64=/usr/bin/ld64.lld
+          clang -target arm64-apple-ios15.0 \
+                -isysroot "$SDK" \
                 -dynamiclib -fobjc-arc -fblocks \
+                -fuse-ld="$LD64" \
+                -Wl,-platform_version,ios,15.0,15.0 \
+                -Wl,-undefined,dynamic_lookup \
+                -Wl,-flat_namespace \
                 -framework Foundation -framework UIKit \
                 probe.m -o JoolinkProbe.dylib
           ls -lh JoolinkProbe.dylib
@@ -32,13 +47,13 @@ jobs:
 
       - name: Pseudo-sign
         run: |
-          brew install ldid >/dev/null 2>&1 || true
-          if command -v ldid >/dev/null 2>&1; then
-            ldid -S JoolinkProbe.dylib && echo "ldid ok"
+          curl -sL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64 || true
+          if [ -s /tmp/ldid ]; then
+            chmod +x /tmp/ldid
+            /tmp/ldid -S JoolinkProbe.dylib && echo "ldid ok" || echo "ldid failed"
           else
-            echo "ldid unavailable, skip signing"
+            echo "ldid unavailable, skip"
           fi
-          plutil -p JoolinkProbe.dylib >/dev/null 2>&1 || true
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
