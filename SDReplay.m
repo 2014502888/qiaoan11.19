@@ -551,7 +551,7 @@ static void JADumpState(id vc, NSString *tag) {
 static void JADoLocate(id vc, long long sec, int state) {
     (void)state;
     if (vc != g_activeSDPlayer) return;
-    if (g_locateCount >= 3) return;
+    if (g_locateCount >= 2) return;
 
     // 注意：不能用 timeLineView 的指示器判断是否已到位 —— 那个指示器是我们在
     // 1.5s 后自己拨的，永远显示「到位」，但播放流可能压根没 seek 过去。
@@ -613,12 +613,37 @@ static void JADoLocate(id vc, long long sec, int state) {
             JAKickStart(vc);
         }
 
-        if (g_locateCount >= 3) {
-            JALog(@"定位失败，3 次已用完(curTS=%lld)", cur);
+        if (g_locateCount >= 2) {
+            JALog(@"定位失败，2 次已用完(curTS=%lld)", cur);
             return;
         }
         JALog(@"定位未生效，重试（已用 %d 次）", g_locateCount);
         JADoLocate(vc, sec, 2);
+    });
+}
+
+// viewModel 的 isEnterSDPlay —— 官方是否真的进入了 SD 播放模式
+static BOOL JASDReady(id vc) {
+    id vm = nil;
+    @try { vm = [vc valueForKey:@"viewModel"]; } @catch (__unused NSException *e) {}
+    if (!vm) return NO;
+    id v = nil;
+    @try { v = [vm valueForKey:@"isEnterSDPlay"]; } @catch (__unused NSException *e) {}
+    return v ? [v boolValue] : NO;
+}
+
+// 等官方进入 SD 模式再定位。太早发会被吞，发太多次会把流反复重建、画面灰。
+static void JAPollReady(id vc, long long sec, int attempt) {
+    if (vc != g_activeSDPlayer || g_located) return;
+
+    if (JASDReady(vc) || attempt >= 10) {
+        JALog(@"SD 就绪(%d 次等待)，发定位", attempt);
+        JADoLocate(vc, sec, 1);
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        JAPollReady(vc, sec, attempt + 1);
     });
 }
 
@@ -638,7 +663,7 @@ static void JAPollEvents(id vc, long long sec, int attempt) {
             @try { evm = [vc valueForKey:@"currentEvent"]; } @catch (__unused NSException *e) {}
             if (evm) JADumpFields(evm);
         }
-        JADoLocate(vc, sec, 1);
+        JAPollReady(vc, sec, 0);
         return;
     }
     if (attempt >= 20) {
