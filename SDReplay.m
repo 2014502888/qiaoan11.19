@@ -471,28 +471,51 @@ static void JADumpFields(id vc) {
     JALog(@"%@", m);
 }
 
+// 打印录像片段范围：sdRecordFileArr 就在 VC 上（IVAR 已确认）
+static void JADumpRecordFiles(id vc, NSString *tag) {
+    NSArray *arr = nil;
+    @try { arr = [vc valueForKey:@"sdRecordFileArr"]; } @catch (__unused NSException *e) {}
+    if (!arr) { JALog(@"[片段] %@ sdRecordFileArr=nil", tag); return; }
+    if (![arr isKindOfClass:NSArray.class]) {
+        JALog(@"[片段] %@ sdRecordFileArr 类型=%@", tag, NSStringFromClass([arr class]));
+        return;
+    }
+    NSArray *a = (NSArray *)arr;
+    JALog(@"[片段] %@ 总数=%lu", tag, (unsigned long)a.count);
+
+    NSUInteger show = a.count < 4 ? a.count : 4;
+    for (NSUInteger i = 0; i < show; i++) {
+        id o = a[i];
+        JALog(@"[片段] #%lu %@ start=%@ end=%@", (unsigned long)i,
+              NSStringFromClass([o class]),
+              JAKVC(o, @"startTimeStamp"), JAKVC(o, @"endTimeStamp"));
+    }
+    if (a.count > 4) {
+        id o = a.lastObject;
+        JALog(@"[片段] 末段 %@ start=%@ end=%@",
+              NSStringFromClass([o class]),
+              JAKVC(o, @"startTimeStamp"), JAKVC(o, @"endTimeStamp"));
+    }
+}
+
 static void JADumpState(id vc, NSString *tag) {
     if (!vc) return;
     id cam = nil;
     @try { cam = [vc valueForKey:@"myCamera"]; } @catch (__unused NSException *e) {}
-    JALog(@"状态[%@] vc.day=%@ cam.day=%@ isEnterSDPlay=%@ isSeekingPlay=%@ curTS=%@",
+    JALog(@"状态[%@] 选中日=%@ 无录像=%@ 卡状态=%@ 正在seek=%@ 暂停中=%@ 设备时间=%@ 原位置=%@ 缓存列表=%@ 重载列表=%@",
           tag,
-          JAKVC(vc, @"sdSelectiontDay"),
-          JAKVC(cam, @"sdSelectiontDay"),
-          JAKVC(vc, @"isEnterSDPlay"),
-          JAKVC(vc, @"isSeekingPlay"),
-          JAKVC(vc, @"currentTimeStamp"));
+          JAKVC(vc, @"currentSelectedSDDay"),
+          JAKVC(vc, @"currentSelectedDayNoRecord"),
+          JAKVC(vc, @"sdCardState"),
+          JAKVC(vc, @"isSeeking"),
+          JAKVC(vc, @"isPausingSDPlay"),
+          JAKVC(vc, @"deviceSystemTimeStamp"),
+          JAKVC(vc, @"beforeSeekTimestamp"),
+          JAKVC(vc, @"isLoadCacheEventList"),
+          JAKVC(vc, @"isReLoadNormalEventList"));
 
-    id tl = nil;
-    @try { tl = [vc valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
-    if (!tl) { JALog(@"状态[%@] timeLineView=nil", tag); return; }
-    JALog(@"状态[%@] tl.curSec=%@ tl.curTS=%@ tl.startTS=%@ tl.endTS=%@ tl.selectSec=%@",
-          tag,
-          JAKVC(tl, @"currentSec"),
-          JAKVC(tl, @"currentTimeStamp"),
-          JAKVC(tl, @"startTimeStamp"),
-          JAKVC(tl, @"endTimeStamp"),
-          JAKVC(tl, @"selectTimeStamp"));
+    JALog(@"状态[%@] curTS=%@ curSec=%@", tag,
+          JAKVC(vc, @"currentTimeStamp"), JAKVC([vc valueForKey:@"timeLineView"], @"currentSec"));
 }
 
 static void JADoLocate(id vc, long long sec, int state) {
@@ -568,6 +591,10 @@ static void JAPollEvents(id vc, long long sec, int attempt) {
     int state = JAEventState(vc);
     if (state == 1 || g_eventsReady) {
         JALog(@"事件就绪(%d 次轮询) → 定位", attempt);
+        JADumpRecordFiles(vc, @"就绪时");
+        id vm = nil;
+        @try { vm = [vc valueForKey:@"viewModel"]; } @catch (__unused NSException *e) {}
+        if (vm) JADumpFields(vm);
         JADoLocate(vc, sec, 1);
         return;
     }
