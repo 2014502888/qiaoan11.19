@@ -48,6 +48,20 @@ static void JALog(NSString *fmt, ...) {
     va_end(ap);
     if (!msg) return;
 
+    static NSDateFormatter *df = nil;
+    if (!df) {
+        @try {
+            df = [[NSDateFormatter alloc] init];
+            df.dateFormat = @"HH:mm:ss.SSS";
+        } @catch (__unused NSException *e) {}
+    }
+    NSString *line = nil;
+    @try {
+        line = [NSString stringWithFormat:@"[%@] %@\n",
+                df ? [df stringFromDate:[NSDate date]] : @"?", msg];
+    } @catch (__unused NSException *e) { line = [msg stringByAppendingString:@"\n"]; }
+    if (!line) return;
+
     pthread_mutex_lock(&gLogMutex);
     @try {
         JASetupLogPath();
@@ -58,7 +72,7 @@ static void JALog(NSString *fmt, ...) {
                 fclose(gLogFile);
                 gLogFile = fopen(gLogPath, "w");
             }
-            const char *u = msg.UTF8String;
+            const char *u = line.UTF8String;
             if (u) { fwrite(u, 1, strlen(u), gLogFile); fflush(gLogFile); }
         }
     } @catch (__unused NSException *e) {}
@@ -287,6 +301,10 @@ static IMP g_orig_rtc_vdd = NULL;
 static long long g_rtcTargetSec = 0;
 static unsigned long long g_rtcVdaGen = 0;
 static BOOL g_located = NO;   // 本次进入是否已发出定位（防重复）
+static double g_t0 = 0;       // 本次 push 的时刻，用于算耗时
+
+#define JANow() [[NSDate date] timeIntervalSinceReferenceDate]
+#define JAElapsed() (g_t0 > 0 ? (JANow() - g_t0) : 0)
 
 // ---------- 创建官方 SD 回放实例（v1.33 核心改动 ①） ----------
 
@@ -394,6 +412,7 @@ static void JADoLocate(id vc, long long sec, int state) {
     if ([vc respondsToSelector:s]) {
         @try { ((void (*)(id, SEL, long long))objc_msgSend)(vc, s, sec); }
         @catch (NSException *e) { JALog(@"v1.33 定位异常: %@", e.reason); }
+        JALog(@"发出定位 (+%.3fs)", JAElapsed());
     } else {
         JALog(@"v1.33 无 startSDPlayWithSelectTimeStamp: —— 4.4.79 可能改名");
     }
@@ -414,6 +433,7 @@ static void JADoLocate(id vc, long long sec, int state) {
         if (tl && [tl respondsToSelector:c]) {
             @try { ((void (*)(id, SEL, long long))objc_msgSend)(tl, c, rel); }
             @catch (__unused NSException *e) {}
+            JALog(@"时间轴同步完成 (+%.3fs)", JAElapsed());
         }
     });
 }
@@ -461,7 +481,14 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     NSString *how = @"?";
     id vc = JACreateSDPlayer(cls, cam, &how);
     if (!vc) { JALog(@"v1.33 创建 VC 失败"); return; }
-    JALog(@"v1.33 创建方式: %@", how);
+
+    g_t0 = JANow();
+    g_located = NO;
+    g_rtcVdaGen = 0;
+    JALog(@"=== 进入回放 设备uid=%@ name=%@ | 创建方式=%@ ===",
+          JAVal(cam, @"uid") ?: @"?",
+          JAVal(cam, @"name") ?: @"?",
+          how);
 
     // camera / 事件 / 时间戳（官方式构造可能已设置，这里补齐，失败不影响）
     @try { [vc setValue:cam forKey:@"myCamera"]; } @catch (__unused NSException *e) {}
@@ -488,8 +515,7 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     g_rtcVdaGen = 0;
     if (nav) {
         g_activeSDPlayer = vc;
-        [nav pushViewController:vc animated:YES];
-    } else {
+        [nav pushViewController:vc animated:YES];    } else {
         [UIApplication.sharedApplication.keyWindow.rootViewController
             presentViewController:vc animated:YES completion:nil];
     }
@@ -513,7 +539,7 @@ static void ja_rtc_viewDidLoad(id self, SEL _cmd) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || g_located) return;
-        JALog(@"viewDidLoad 阶段切日 → 秒=%lld", sec);
+        JALog(@"viewDidLoad 阶段切日 → 秒=%lld (+%.3fs)", sec, JAElapsed());
         JASwitchDay(self, sec);
         JAPollEvents(self, sec, 0);
     });
