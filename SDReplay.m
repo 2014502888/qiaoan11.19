@@ -292,12 +292,15 @@ static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static void ja_rtc_viewDidLoad(id self, SEL _cmd);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
+static void ja_rtc_reloadTimeLine(id self, SEL _cmd, long long day, id arr, long long type);
 
 static id g_activeSDPlayer = nil;
 static BOOL g_rtcHooked = NO;
 static IMP g_orig_rtc_vdl = NULL;
 static IMP g_orig_rtc_vda = NULL;
 static IMP g_orig_rtc_vdd = NULL;
+static IMP g_orig_rtc_reload = NULL;
+static BOOL g_eventsReady = NO;   // 官方 reload 回调已给出目标日数据
 static long long g_rtcTargetSec = 0;
 static unsigned long long g_rtcVdaGen = 0;
 static BOOL g_located = NO;   // 已发过定位（保留给旧的判断用）
@@ -489,18 +492,14 @@ static void JAPollEvents(id vc, long long sec, int attempt) {
     if (vc != g_activeSDPlayer || g_located) return;
 
     int state = JAEventState(vc);
-    if (state == 1) {
+    if (state == 1 || g_eventsReady) {
         JALog(@"事件就绪(%d 次轮询) → 定位", attempt);
         JADoLocate(vc, sec, 1);
         return;
     }
-    if (state == -1) {
-        JALog(@"事件数组不可见，直接定位");
-        JADoLocate(vc, sec, -1);
-        return;
-    }
     if (attempt >= 20) {
-        JALog(@"事件等待超时(6s, 仍为空) → 保底定位");
+        // 属性探测不到 + 官方 reload 回调也没等到 → 才保底
+        JALog(@"事件等待超时(6s, 未收到 reload) → 保底定位");
         JADoLocate(vc, sec, 0);
         return;
     }
@@ -531,6 +530,7 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     g_t0 = JANow();
     g_located = NO;
     g_locateCount = 0;
+    g_eventsReady = NO;
     g_rtcVdaGen = 0;
     JALog(@"=== 进入回放 设备uid=%@ name=%@ | 创建方式=%@ ===",
           JAVal(cam, @"uid") ?: @"?",
@@ -622,6 +622,41 @@ static void ja_rtc_viewDidDisappear(id self, SEL _cmd) {
             @catch (__unused NSException *e) {}
         }
     });
+}
+
+// 官方时间轴重载完成回调：timePaintingArray 就是该日的录像片段数组。
+// 这是「数据真的到了」的唯一可靠信号，比猜属性名靠谱。
+static void ja_rtc_reloadTimeLine(id self, SEL _cmd, long long day, id arr, long long type) {
+    if (g_orig_rtc_reload) {
+        ((void (*)(id, SEL, long long, id, long long))g_orig_rtc_reload)(self, _cmd, day, arr, type);
+    }
+    if (self != g_activeSDPlayer) return;
+
+    NSUInteger n = 0;
+    if ([arr isKindOfClass:NSArray.class]) {
+        n = [(NSArray *)arr count];
+    } else if ([arr respondsToSelector:@selector(count)]) {
+        n = ((NSUInteger (*)(id, SEL))objc_msgSend)(arr, @selector(count));
+    }
+
+    long long targetDay = JADayStartSec(@(g_rtcTargetSec));
+    JALog(@"事件重载 day=%lld count=%lu type=%lld | 目标日=%lld (+%.3fs)",
+          day, (unsigned long)n, type, targetDay, JAElapsed());
+
+    if (targetDay > 0 && day != targetDay) {
+        JALog(@"  不是目标日，忽略");
+        return;
+    }
+    if (n == 0) {
+        JALog(@"  目标日录像片段为 0 —— 官方数据确实是空的");
+        return;
+    }
+
+    g_eventsReady = YES;
+    if (g_locateCount < 2) {
+        JALog(@"  数据到位 → 定位");
+        JADoLocate(self, g_rtcTargetSec, 1);
+    }
 }
 
 static void *g_lastDetailVC = NULL;
@@ -717,6 +752,8 @@ static void JAHook(void) {
             JASetImp(rtcCls, @selector(viewDidLoad), (IMP)ja_rtc_viewDidLoad, &g_orig_rtc_vdl);
             JASetImp(rtcCls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
             JASetImp(rtcCls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
+            JASetImp(rtcCls, NSSelectorFromString(@"reloadTimeLineWithsdSelectiontDay:timePaintingArray:reloadType:"),
+                     (IMP)ja_rtc_reloadTimeLine, &g_orig_rtc_reload);
             g_rtcHooked = YES;
             JALog(@"v1.33 SD 播放器 hooks 已装");
         }
