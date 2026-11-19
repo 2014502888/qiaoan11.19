@@ -396,6 +396,7 @@ static int JAEventState(id vc) {
 
 static void JADumpRecordFiles(id vc, NSString *tag);
 static NSString *JAKVC(id obj, NSString *key);
+static void JADumpEventFields(id e);
 
 static void JASwitchDay(id vc, long long sec) {
     long long dayStart = JADayStartSec(@(sec));
@@ -478,6 +479,17 @@ static void JASwitchDay(id vc, long long sec) {
               JAKVC(vc, @"isLoadCacheEventList"),
               JAKVC(vc, @"isReLoadNormalEventList"),
               JAKVC(vc, @"currentSelectedSDDay"));
+        // 确认 camera 上的选中日到底有没有被改成功（keyPath 失败会静默无效）
+        id cam2 = nil;
+        @try { cam2 = [vc valueForKey:@"myCamera"]; } @catch (__unused NSException *e) {}
+        JALog(@"切日后2s camera.sdSelectiontDay=%@", JAKVC(cam2, @"sdSelectiontDay"));
+        // 确认事件列表里装的是哪一天的报警
+        NSArray *evs = nil;
+        @try { evs = [vc valueForKey:@"sdRecordFileArr"]; } @catch (__unused NSException *e) {}
+        if ([evs isKindOfClass:NSArray.class] && evs.count > 0) {
+            JADumpEventFields(evs[0]);
+            if (evs.count > 1) JADumpEventFields(evs.lastObject);
+        }
     });
 
     @try { [vc setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"]; }
@@ -493,6 +505,26 @@ static NSString *JAKVC(id obj, NSString *key) {
         if ([obj isKindOfClass:NSArray.class]) return [NSString stringWithFormat:@"%lu项", (unsigned long)[(NSArray *)v count]];
         return [v description];
     } @catch (NSException *e) { return @"-"; }
+}
+
+// 定向打印一个报警事件模型的字段（用来判断事件列表到底是哪一天的）
+static void JADumpEventFields(id e) {
+    if (!e) { JALog(@"事件字段: nil"); return; }
+    Class cls = object_getClass(e);
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(cls, &n);
+    NSMutableString *s = [NSMutableString stringWithFormat:@"事件字段(%@, %u 个): ", NSStringFromClass(cls), n];
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = ivar_getName(ivars[i]);
+        if (!nm) continue;
+        NSString *key = [NSString stringWithUTF8String:nm];
+        if ([key hasPrefix:@"_"]) key = [key substringFromIndex:1];
+        NSString *val = JAKVC(e, key);
+        if (val.length > 40) val = [[val substringToIndex:40] stringByAppendingString:@"..."];
+        [s appendFormat:@"%s=%@ | ", nm, val];
+    }
+    if (ivars) free(ivars);
+    JALog(@"%@", s);
 }
 
 // 把播放器/时间轴的真实状态打出来，用来区分「指示器到位」和「播放流到位」
