@@ -408,6 +408,42 @@ static void JASwitchDay(id vc, long long sec) {
     @catch (__unused NSException *e) {}
 }
 
+static NSString *JAKVC(id obj, NSString *key) {
+    if (!obj) return @"-";
+    @try {
+        id v = [obj valueForKey:key];
+        if (!v) return @"nil";
+        if ([v isKindOfClass:NSNumber.class]) return [NSString stringWithFormat:@"%@", v];
+        if ([obj isKindOfClass:NSArray.class]) return [NSString stringWithFormat:@"%lu项", (unsigned long)[(NSArray *)v count]];
+        return [v description];
+    } @catch (NSException *e) { return @"-"; }
+}
+
+// 把播放器/时间轴的真实状态打出来，用来区分「指示器到位」和「播放流到位」
+static void JADumpState(id vc, NSString *tag) {
+    if (!vc) return;
+    id cam = nil;
+    @try { cam = [vc valueForKey:@"myCamera"]; } @catch (__unused NSException *e) {}
+    JALog(@"状态[%@] vc.day=%@ cam.day=%@ isEnterSDPlay=%@ isSeekingPlay=%@ curTS=%@",
+          tag,
+          JAKVC(vc, @"sdSelectiontDay"),
+          JAKVC(cam, @"sdSelectiontDay"),
+          JAKVC(vc, @"isEnterSDPlay"),
+          JAKVC(vc, @"isSeekingPlay"),
+          JAKVC(vc, @"currentTimeStamp"));
+
+    id tl = nil;
+    @try { tl = [vc valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
+    if (!tl) { JALog(@"状态[%@] timeLineView=nil", tag); return; }
+    JALog(@"状态[%@] tl.curSec=%@ tl.curTS=%@ tl.startTS=%@ tl.endTS=%@ tl.selectSec=%@",
+          tag,
+          JAKVC(tl, @"currentSec"),
+          JAKVC(tl, @"currentTimeStamp"),
+          JAKVC(tl, @"startTimeStamp"),
+          JAKVC(tl, @"endTimeStamp"),
+          JAKVC(tl, @"selectTimeStamp"));
+}
+
 static void JADoLocate(id vc, long long sec, int state) {
     (void)state;
     if (vc != g_activeSDPlayer) return;
@@ -419,11 +455,17 @@ static void JADoLocate(id vc, long long sec, int state) {
     g_locateCount++;
     g_located = YES;
 
+    JADumpState(vc, @"定位前");
+
     SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
     if ([vc respondsToSelector:s]) {
         @try { ((void (*)(id, SEL, long long))objc_msgSend)(vc, s, sec); }
         @catch (NSException *e) { JALog(@"v1.33 定位异常: %@", e.reason); }
         JALog(@"第 %d 次定位 (+%.3fs)", g_locateCount, JAElapsed());
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (vc == g_activeSDPlayer) JADumpState(vc, @"定位后1s");
+        });
     } else {
         JALog(@"v1.33 无 startSDPlayWithSelectTimeStamp: —— 4.4.79 可能改名");
         return;
