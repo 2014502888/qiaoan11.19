@@ -406,8 +406,27 @@ static void JASwitchDay(id vc, long long sec) {
     if ([vc respondsToSelector:sw]) {
         @try { ((void (*)(id, SEL, long long, id))objc_msgSend)(vc, sw, dayStart, ds); }
         @catch (NSException *e) { JALog(@"v1.50 switchToSDDay 异常: %@", e.reason); }
+        JALog(@"切日 switchToSDDay → day=%lld date=%@", dayStart, ds);
     } else {
         JALog(@"v1.50 无 switchToSDDay:dateString: —— 4.4.79 可能改名");
+    }
+
+    // 关键：switchToSDDay 只改「选中日」这个状态，不会重新拉当天的事件列表。
+    // 不重拉 → 时间轴没有报警色条（缺色带），seek 到了也是空画面。
+    // 官方 viewDidLoad 已按今日拉过一次，这里必须显式请求报警那一天的事件。
+    SEL lr = NSSelectorFromString(@"loadRecordListWithSelectiontDay:");
+    if ([vc respondsToSelector:lr]) {
+        @try { ((void (*)(id, SEL, long long))objc_msgSend)(vc, lr, dayStart); }
+        @catch (NSException *e) { JALog(@"loadRecordList 异常: %@", e.reason); }
+        JALog(@"重拉当天事件 loadRecordListWithSelectiontDay: %lld", dayStart);
+    } else {
+        JALog(@"无 loadRecordListWithSelectiontDay:，尝试 loadRecordListWithType:");
+        SEL lt = NSSelectorFromString(@"loadRecordListWithType:");
+        if ([vc respondsToSelector:lt]) {
+            @try { ((void (*)(id, SEL, long long))objc_msgSend)(vc, lt, 0); }
+            @catch (NSException *e) { JALog(@"loadRecordListWithType 异常: %@", e.reason); }
+            JALog(@"重拉事件 loadRecordListWithType: 0");
+        }
     }
 
     @try { [vc setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"]; }
@@ -832,7 +851,13 @@ static void ja_rtc_viewDidLoad(id self, SEL _cmd) {
         JALog(@"viewDidLoad 阶段切日 → 秒=%lld (+%.3fs)", sec, JAElapsed());
         g_daySwitched = YES;
         JASwitchDay(self, sec);
-        JAPollEvents(self, sec, 0);
+        // 切日 + 重拉事件后，数组里可能还残留「今日」的旧数据，
+        // 立刻轮询会误判就绪、拿旧事件去定位。等 1.5s 让官方清空再重填。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self != g_activeSDPlayer || g_located) return;
+            JAPollEvents(self, sec, 0);
+        });
     });
 }
 
@@ -853,7 +878,11 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         JALog(@"viewDidAppear 兜底切日 → 秒=%lld (+%.3fs)", sec, JAElapsed());
         g_daySwitched = YES;
         JASwitchDay(self, sec);
-        JAPollEvents(self, sec, 0);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self != g_activeSDPlayer || g_located) return;
+            JAPollEvents(self, sec, 0);
+        });
     });
 }
 
