@@ -408,42 +408,14 @@ static void JASwitchDay(id vc, long long sec) {
     @catch (__unused NSException *e) {}
 }
 
-// 读时间轴当前秒，判断是否已经到位（属性名不确定，取不到就当没到位）
-static BOOL JAAlreadyAt(id vc, long long sec) {
-    long long dayStart = JADayStartSec(@(sec));
-    if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
-    long long rel = sec - dayStart;
-    if (rel < 0) rel = 0;
-    if (rel > 86399) rel = 86399;
-
-    id tl = nil;
-    @try { tl = [vc valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
-    if (!tl) return NO;
-
-    id cur = nil;
-    @try { cur = [tl valueForKey:@"currentSec"]; } @catch (__unused NSException *e) {}
-    if (!cur) {
-        @try { cur = [tl valueForKey:@"currentTimeStamp"]; } @catch (__unused NSException *e) {}
-    }
-    if (!cur) return NO;
-
-    long long v = [cur longLongValue];
-    long long d = v - rel;
-    if (d < 0) d = -d;
-    return d <= 10;
-}
-
 static void JADoLocate(id vc, long long sec, int state) {
     (void)state;
     if (vc != g_activeSDPlayer) return;
-    if (g_locateCount >= 2) return;
+    if (g_locateCount >= 3) return;
 
-    // 第二次之前先看是否已到位，避免重复 seek 造成闪屏
-    if (g_locateCount == 1 && JAAlreadyAt(vc, sec)) {
-        JALog(@"补发前检查: 已到位，跳过");
-        return;
-    }
-
+    // 注意：不能用 timeLineView 的指示器判断是否已到位 —— 那个指示器是我们在
+    // 1.5s 后自己拨的，永远显示「到位」，但播放流可能压根没 seek 过去。
+    // 官方在 isEnterSDPlay 未就绪时会静默吞掉定位，所以只能无条件重试。
     g_locateCount++;
     g_located = YES;
 
@@ -451,9 +423,10 @@ static void JADoLocate(id vc, long long sec, int state) {
     if ([vc respondsToSelector:s]) {
         @try { ((void (*)(id, SEL, long long))objc_msgSend)(vc, s, sec); }
         @catch (NSException *e) { JALog(@"v1.33 定位异常: %@", e.reason); }
-        JALog(@"发出定位 (+%.3fs)", JAElapsed());
+        JALog(@"第 %d 次定位 (+%.3fs)", g_locateCount, JAElapsed());
     } else {
         JALog(@"v1.33 无 startSDPlayWithSelectTimeStamp: —— 4.4.79 可能改名");
+        return;
     }
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
@@ -476,13 +449,13 @@ static void JADoLocate(id vc, long long sec, int state) {
         }
     });
 
-    // 冷启动首次进入时官方流上下文可能还没建好，定位会被内部预检查静默丢弃
-    // （现象：定位没跳，返回再进就跳了）。首次发完 1.8s 补发一次，补前先查是否已到位。
-    if (g_locateCount == 1) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
+    // 官方在流上下文未就绪时会静默丢弃定位（现象：定位没跳、返回再进才跳）。
+    // 无条件重试，最多 3 次，第三次约在 +3.1s，正是 v1.32 那个稳态窗口。
+    if (g_locateCount < 3) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (vc != g_activeSDPlayer || g_locateCount >= 2) return;
-            JALog(@"补发定位（首次可能被官方预检查吞掉）");
+            if (vc != g_activeSDPlayer || g_locateCount >= 3) return;
+            JALog(@"重试定位（上次可能被官方吞掉）");
             JADoLocate(vc, sec, 2);
         });
     }
@@ -659,7 +632,7 @@ static void ja_rtc_reloadTimeLine(id self, SEL _cmd, long long day, id arr, long
     }
 
     g_eventsReady = YES;
-    if (g_locateCount < 2) {
+    if (g_locateCount < 3) {
         JALog(@"  数据到位 → 定位");
         JADoLocate(self, g_rtcTargetSec, 1);
     }
