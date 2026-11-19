@@ -22,6 +22,7 @@
 #import <objc/message.h>
 #import <pthread.h>
 #import <stdio.h>
+#import <string.h>
 #import <sys/stat.h>
 
 // ---------- 日志（纯 C，不经任何被 hook 的 ObjC 方法） ----------
