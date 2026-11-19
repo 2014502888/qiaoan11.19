@@ -422,45 +422,8 @@ static NSString *JAKVC(id obj, NSString *key) {
 // 把播放器/时间轴的真实状态打出来，用来区分「指示器到位」和「播放流到位」
 // 播放流真实位置：vc.currentTimeStamp 是官方播放器的当前秒（日志实测可用），
 // 和时间轴指示器不同 —— 指示器是我们自己拨的，不能用来判断定位是否生效。
-// 流没起来时用官方自己的启动方法踢一下（METH 里确认存在）
-static void JAKickStart(id vc) {
-    if (!vc) return;
-    SEL s1 = NSSelectorFromString(@"ja_ReallyStartPlay");
-    if ([vc respondsToSelector:s1]) {
-        JALog(@"踢流: ja_ReallyStartPlay");
-        @try { ((void (*)(id, SEL))objc_msgSend)(vc, s1); }
-        @catch (NSException *e) { JALog(@"踢流异常: %@", e.reason); }
-        return;
-    }
-    SEL s2 = NSSelectorFromString(@"ja_startPlay");
-    if ([vc respondsToSelector:s2]) {
-        JALog(@"踢流: ja_startPlay");
-        @try { ((void (*)(id, SEL))objc_msgSend)(vc, s2); }
-        @catch (NSException *e) { JALog(@"踢流异常: %@", e.reason); }
-        return;
-    }
-    SEL s3 = NSSelectorFromString(@"resumePlay");
-    if ([vc respondsToSelector:s3]) {
-        JALog(@"踢流: resumePlay");
-        @try { ((void (*)(id, SEL))objc_msgSend)(vc, s3); }
-        @catch (NSException *e) { JALog(@"踢流异常: %@", e.reason); }
-    }
-}
-
-static long long JAStreamValue(id vc) {
-    id cur = nil;
-    @try { cur = [vc valueForKey:@"currentTimeStamp"]; } @catch (__unused NSException *e) {}
-    if (!cur) return 0;
-    return [cur longLongValue];
-}
-
-static BOOL JAStreamAt(id vc, long long sec) {
-    long long v = JAStreamValue(vc);
-    if (v <= 0) return NO;
-    long long d = v - sec;
-    if (d < 0) d = -d;
-    return d <= 60;
-}
+// 唯一的成功信号是 viewModel.isEnterSDPlay 从 0 变 1。
+// 注意：currentTimeStamp 是「实时/设备当前时间」，不是播放位置，不能拿来判成败。
 
 // 把 VC 的全部 ivar / 属性名打出来（只打名字和类型，不打值），
 // 用来找到真实的「事件数组 / 播放状态 / 流上下文」字段名，不再靠猜属性。
@@ -548,6 +511,9 @@ static void JADumpState(id vc, NSString *tag) {
           JAKVC(vm, @"currentTimeStamp"));
 }
 
+// 前向声明（JADoLocate 内部要用，必须先声明）
+static BOOL JASDReady(id vc);
+
 static void JADoLocate(id vc, long long sec, int state) {
     (void)state;
     if (vc != g_activeSDPlayer) return;
@@ -614,9 +580,6 @@ static void JADoLocate(id vc, long long sec, int state) {
         JADoLocate(vc, sec, 2);
     });
 }
-
-// 前向声明
-static BOOL JASDReady(id vc);
 
 // viewModel 的 isEnterSDPlay —— 官方是否真的进入了 SD 播放模式
 static BOOL JASDReady(id vc) {
