@@ -1,20 +1,40 @@
-# Joolink 探针（dylib 注入版）
+# Joolink 探针 v2（dylib / TrollFools 注入）
 
-针对乔安智联 4.4.79（`com.qiaoan.qiaoanzhilian`）的**只读观测 dylib**。
-用来定位「个别设备跳转回放后直接显示当前时间无录像」到底是哪一环断了。
+针对乔安智联 4.4.79（`com.qiaoan.qiaoanzhilian`）的只读观测 dylib。
+用于定位「个别设备跳转回放后直接显示当前时间无录像」走的是哪条链路、接口返回了什么。
 
-无 Theos、无 deb、无 plist，纯 `probe.m` + clang 编译出一个 dylib，自己注入。
+**骨架照搬你 v1.32（乔安智联SD直达回放）那套已验证的做法**，不是新写法。
 
-## 产物
+## v2 相对 v1 改了什么（v1 注入闪退的根因）
 
-`JoolinkProbe.dylib`（arm64，iOS 15.0+，依赖 Foundation / UIKit）
+| 项 | v1（崩） | v2（本版） |
+|---|---|---|
+| 系统类 hook | hook 了 `NSFileManager fileExistsAtPath:` | **完全不碰系统类** |
+| 日志 | ObjC 文件 API + 路径判断 | 纯 C `fopen/fwrite/stat`，pthread 锁 |
+| 安装时机 | constructor 直接装齐 | constructor 先同步试一次，类不在则轮询 0.5s×30 |
+| 幂等 | 无 | `cur == newImp` 跳过，防重复注入（同 `JASetImp`） |
+| 异常 | 无保护 | 每个入口 `@try/@catch`，constructor 内异常不上抛 |
+
+与 v1.32 完全一致的三点：
+1. `JPSetImp(Class, SEL, IMP, IMP*)` —— 先取原实现再 `method_setImplementation`
+2. `__attribute__((constructor))` 里只做**轻量检查**（`NSClassFromString`），不做重活
+3. 类晚加载时后台线程 `sleep 0.5s` 轮询、回主队列重试，最多 30 次
+
+## 只 hook 两个 Flutter 类 + 一个网络类
+
+| 类 | 方法 | 作用 |
+|---|---|---|
+| `FlutterMethodChannel` | `setMethodCallHandler:` | Dart → 原生：拿到方法名、入参，并包一层 result 拿返回值 |
+| `FlutterMethodChannel` | `invokeMethod:arguments:` | 原生 → Dart：错误回调、事件推送 |
+| `AFHTTPResponseSerializer` | `responseObjectForResponse:data:error:` | 原生网络请求 URL 与响应长度（类不存在则跳过） |
+
+**不再 hook `NSFileManager`**——回放问题和越狱检测无关，那条 hook 只有风险没有收益。
 
 ## 编译
 
-GitHub Actions 已配好（`.github/workflows/build.yml`），push 到 `main` 自动编译，
-在 Actions 页面下载 `JoolinkProbe-dylib` 产物。
+GitHub Actions 已配（ubuntu + clang 交叉编译），push 到 `main` 自动出 `JoolinkProbe.dylib`。
 
-本机编译（macOS）：
+本机：
 
 ```bash
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -25,27 +45,37 @@ clang -isysroot "$SDK" -arch arm64 -miphoneos-version-min=15.0 \
 ldid -S JoolinkProbe.dylib
 ```
 
-## 记录什么
+## 注入（TrollFools）
 
-| 前缀 | 内容 | 用途 |
-|---|---|---|
-| `CH-IN` | Flutter 通道调用：通道名、方法、入参 | 看那台设备走了哪条链路 |
-| `CH-OUT` | 同一调用的**返回值** | **最关键**：接口有没有数据 |
-| `CH→Dart` | 原生回调 Dart | 错误码、空列表 |
-| `NET` | AFNetworking 请求 URL + 字节数 | 原生侧接口 |
-| `JB` | 越狱路径查询结果 | 广告 SDK 检测行为 |
+直接拖 `JoolinkProbe.dylib` 进 TrollFools，选 `Joolink` 注入即可。
+TrollFools 会自己重签，不需要额外的 plist 或 Bundle 配置。
 
-启动时会打一行自检：
+## 验证顺序
+
+1. 注入 → 重启 app
+2. 看日志第一行：
 
 ```
-=== JoolinkProbe(dylib) loaded | CH-handler=1 CH-invoke=1 NET=1 JB=1 | log=... ===
+=== JoolinkProbe v2 loaded | log=... ===
 ```
 
-四个值都是 1 才算四个 hook 点全部挂上。哪个是 0，说明那个类或方法在这个版本里不存在，要换 hook 点。
+3. 再看是否出现：
+
+```
+=== hooks ready | chan=1 net=1 ===
+```
+
+`chan=1` 是关键。如果是 0，说明 `FlutterMethodChannel` 没找到（Flutter framework 未加载或类名变了），日志里会有：
+
+```
+=== poll finished | chan=0 net=? tries=30 ===
+```
+
+有这行就说明轮询 15 秒都没等到，需要换 hook 点，把日志发我。
 
 ## 日志位置
 
-App 沙箱内 `Documents/jl_probe.log`。
+`Documents/jl_probe.log`（沙箱内）。
 
 ```bash
 ssh root@设备IP
@@ -53,32 +83,27 @@ find /var/mobile/Containers/Data/Application -name jl_probe.log 2>/dev/null
 scp root@设备IP:"<上面路径>" ./jl_probe.log
 ```
 
-或开 Console.app 过滤 `com.jl.probe` 实时看。
-
 ## 测试步骤
 
-1. 注入 dylib，重启 Joolink
-2. **先正常进一次好设备的回放**（留基线）
-3. 再进那台失效设备的回放
-4. 等 10 秒退出
-5. 拉日志对比
+1. 先进一台**正常设备**的回放（留基线）
+2. 再进那台**失效设备**的回放
+3. 等 10 秒退出，拉日志对比
 
-## 怎么读结论
+## 怎么读
 
-看 `CH-OUT`：
+核心是 `CH-OUT`：
 
 ```
-[12:04:32.115] CH-OUT com.jooan.record-plan.fetch-sd-company :: fetchSDCompany  ret={code=0, list=[]}
+CH-OUT com.jooan.record-plan.fetch-sd-company :: fetchSDCompany  ret={code=0, list=[]}
 ```
 
-- `list=[]` → 那台设备根本没有那天录像数据，问题在设备侧/服务端，跟 UI 无关
-- `list` 有数据但界面空 → 前端解析问题，才需要动 hook
-- `CH-IN` 里完全没有 `record-plan` 相关调用 → 没走到这一步，问题更靠前（设备能力查询/权限）
+- `list=[]` → 设备/服务端就没那天录像，跟 UI 无关
+- 有数据但界面空 → 前端解析问题
+- 完全没有 `record-plan` 的 `CH-IN` → 没走到这步，问题更靠前
 
 ## 注意
 
-1. 日志上限 20 MB，超了自动清空，不会写满设备。
-2. 参数截前 3000 字符，大 JSON 不会撑爆。
-3. 纯 runtime hook（`method_setImplementation`），不依赖 ElleKit/Substrate API，注入即生效。
-4. 只读，不改任何业务逻辑，可以和路径隐藏 tweak 共存。
-5. 如果编译失败，把 Actions 的日志发我。
+1. 日志 20 MB 上限，超了自动重写，不会写满。
+2. 参数截前 3000 字符。
+3. 只读，不改业务逻辑，可以和安全相关的 tweak 共存。
+4. 如果还闪退，把 `CrashReporter` 里 `Joolink*.ips` 的异常类型和崩溃线程栈发我——这次 v2 已经把系统类 hook 全去掉，理论上不会再因为重入 Foundation 崩。
