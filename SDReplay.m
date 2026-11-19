@@ -422,11 +422,40 @@ static NSString *JAKVC(id obj, NSString *key) {
 // 把播放器/时间轴的真实状态打出来，用来区分「指示器到位」和「播放流到位」
 // 播放流真实位置：vc.currentTimeStamp 是官方播放器的当前秒（日志实测可用），
 // 和时间轴指示器不同 —— 指示器是我们自己拨的，不能用来判断定位是否生效。
-static BOOL JAStreamAt(id vc, long long sec) {
+// 流没起来时用官方自己的启动方法踢一下（METH 里确认存在）
+static void JAKickStart(id vc) {
+    if (!vc) return;
+    SEL s1 = NSSelectorFromString(@"ja_ReallyStartPlay");
+    if ([vc respondsToSelector:s1]) {
+        JALog(@"踢流: ja_ReallyStartPlay");
+        @try { ((void (*)(id, SEL))objc_msgSend)(vc, s1); }
+        @catch (NSException *e) { JALog(@"踢流异常: %@", e.reason); }
+        return;
+    }
+    SEL s2 = NSSelectorFromString(@"ja_startPlay");
+    if ([vc respondsToSelector:s2]) {
+        JALog(@"踢流: ja_startPlay");
+        @try { ((void (*)(id, SEL))objc_msgSend)(vc, s2); }
+        @catch (NSException *e) { JALog(@"踢流异常: %@", e.reason); }
+        return;
+    }
+    SEL s3 = NSSelectorFromString(@"resumePlay");
+    if ([vc respondsToSelector:s3]) {
+        JALog(@"踢流: resumePlay");
+        @try { ((void (*)(id, SEL))objc_msgSend)(vc, s3); }
+        @catch (NSException *e) { JALog(@"踢流异常: %@", e.reason); }
+    }
+}
+
+static long long JAStreamValue(id vc) {
     id cur = nil;
     @try { cur = [vc valueForKey:@"currentTimeStamp"]; } @catch (__unused NSException *e) {}
-    if (!cur) return NO;
-    long long v = [cur longLongValue];
+    if (!cur) return 0;
+    return [cur longLongValue];
+}
+
+static BOOL JAStreamAt(id vc, long long sec) {
+    long long v = JAStreamValue(vc);
     if (v <= 0) return NO;
     long long d = v - sec;
     if (d < 0) d = -d;
@@ -576,8 +605,16 @@ static void JADoLocate(id vc, long long sec, int state) {
             JALog(@"定位成功，流位置已在目标 (%d 次)", g_locateCount);
             return;
         }
+
+        long long cur = JAStreamValue(vc);
+        if (cur <= 0) {
+            // 时间戳收到了、SD 模式也进了，但播放位置还是 0 —— 流没起来，踢一下
+            JALog(@"流未启动(curTS=%lld)，踢流 (%d 次)", cur, g_locateCount);
+            JAKickStart(vc);
+        }
+
         if (g_locateCount >= 3) {
-            JALog(@"定位失败，3 次已用完");
+            JALog(@"定位失败，3 次已用完(curTS=%lld)", cur);
             return;
         }
         JALog(@"定位未生效，重试（已用 %d 次）", g_locateCount);
