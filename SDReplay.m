@@ -194,7 +194,22 @@ static id JAFindCamera(UIViewController *detailVC, id warn, NSString **src) {
 
 // ---------- 时间戳 ----------
 
+// 时间戳合理区间：2020-01-01 ~ 2035-01-01
+// 4.4.79 的 event_file_url / eventTimeUTC 可能夹带设备固件时间（如 2012 年），
+// 不加校验会直接定位到十几年前 → 必然判"无录像" → 回实时。
+#define JA_SEC_MIN 1577836800LL
+#define JA_SEC_MAX 2051222400LL
+
+static BOOL JASecValid(long long v) { return v >= JA_SEC_MIN && v < JA_SEC_MAX; }
+
 static NSNumber *JABuildTimestamp(id warn) {
+    JALog(@"TS 候选 url=%@ | utc=%@ | date=%@ | time=%@",
+          JAVal(warn, @"event_file_url"),
+          JAVal(warn, @"eventTimeUTC"),
+          JAVal(warn, @"event_date"),
+          JAVal(warn, @"event_time"));
+
+    // ① event_file_url 文件名内嵌 10 位秒
     id url = JAVal(warn, @"event_file_url");
     if ([url isKindOfClass:NSString.class]) {
         NSString *u = url;
@@ -202,15 +217,29 @@ static NSNumber *JABuildTimestamp(id warn) {
                                                                             options:0 error:nil];
         NSTextCheckingResult *m = [re firstMatchInString:u options:0 range:NSMakeRange(0, u.length)];
         if (m && m.numberOfRanges > 1) {
-            return @([[u substringWithRange:[m rangeAtIndex:1]] longLongValue]);
+            long long v = [[u substringWithRange:[m rangeAtIndex:1]] longLongValue];
+            if (JASecValid(v)) {
+                JALog(@"TS 采用① url 秒=%lld", v);
+                return @(v);
+            }
+            JALog(@"TS 拒绝① url 秒=%lld（超出 2020~2035）", v);
         }
     }
+
+    // ② eventTimeUTC（4.4.79 可能变成非秒格式，必须校验）
     id t = JAVal(warn, @"eventTimeUTC");
     if (t) {
-        if ([t isKindOfClass:NSNumber.class]) return t;
-        if ([t isKindOfClass:NSString.class]) return @((long long)[t doubleValue]);
-        return nil;
+        long long v = 0;
+        if ([t isKindOfClass:NSNumber.class]) v = [t longLongValue];
+        else if ([t isKindOfClass:NSString.class]) v = (long long)[t doubleValue];
+        if (JASecValid(v)) {
+            JALog(@"TS 采用② eventTimeUTC=%lld", v);
+            return @(v);
+        }
+        JALog(@"TS 拒绝② eventTimeUTC=%lld（原始值=%@）", v, t);
     }
+
+    // ③ event_date + event_time 拼本地秒
     NSString *d = JAVal(warn, @"event_date");
     NSString *tm = JAVal(warn, @"event_time");
     if (d.length && tm.length) {
@@ -219,8 +248,19 @@ static NSNumber *JABuildTimestamp(id warn) {
         fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
         fmt.timeZone = [NSTimeZone localTimeZone];
         NSDate *date = [fmt dateFromString:[NSString stringWithFormat:@"%@ %@", d, tm]];
-        if (date) return @((long long)[date timeIntervalSince1970]);
+        if (date) {
+            long long v = (long long)[date timeIntervalSince1970];
+            if (JASecValid(v)) {
+                JALog(@"TS 采用③ %@ %@ → %lld", d, tm, v);
+                return @(v);
+            }
+            JALog(@"TS 拒绝③ %@ %@ → %lld", d, tm, v);
+        } else {
+            JALog(@"TS ③ 日期解析失败 d=%@ t=%@", d, tm);
+        }
     }
+
+    JALog(@"TS 全部来源无效，无法定位");
     return nil;
 }
 
@@ -291,19 +331,21 @@ static id JACreateSDPlayer(Class cls, id cam, NSString **how) {
 // ---------- 事件就绪判断（v1.33 核心改动 ③） ----------
 
 static id JAEventArray(id vc) {
-    id arr = JAVal(vc, @"sdRecordFileArr");
-    if (arr) return arr;
-    id vm = JAVal(vc, @"viewModel");
-    if (vm) {
-        arr = JAVal(vm, @"sdRecordFileArr");
-        if (arr) return arr;
-        arr = JAVal(vm, @"sdRecordList");
+    NSArray *direct = @[@"sdRecordFileArr", @"sdRecordList", @"sdRecordArr", @"sdRecords", @"recordList"];
+    for (NSString *k in direct) {
+        id arr = JAVal(vc, k);
         if (arr) return arr;
     }
-    arr = JAVal(vc, @"sdRecordList");
-    if (arr) return arr;
-    arr = JAVal(vc, @"sdRecordArr");
-    return arr;
+    NSArray *vmKeys = @[@"viewModel", @"sdPlayViewModel", @"playViewModel", @"vm", @"sdViewModel"];
+    for (NSString *vk in vmKeys) {
+        id vm = JAVal(vc, vk);
+        if (!vm) continue;
+        for (NSString *k in direct) {
+            id arr = JAVal(vm, k);
+            if (arr) return arr;
+        }
+    }
+    return nil;
 }
 
 // 返回：-1 无法判断（属性都不存在）  0 空  1 有数据
@@ -420,6 +462,13 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     // camera / 事件 / 时间戳（官方式构造可能已设置，这里补齐，失败不影响）
     @try { [vc setValue:cam forKey:@"myCamera"]; } @catch (__unused NSException *e) {}
     if (warn) {
+        // 4.4.79 字段可能改名，打印完整描述便于核对真实字段
+        @try {
+            NSString *desc = [warn description];
+            if (desc.length > 1500) desc = [[desc substringToIndex:1500] stringByAppendingString:@"…"];
+            JALog(@"warn=%@", desc);
+        } @catch (__unused NSException *e) {}
+
         JASet(vc, @"currentEvent", warn);
         NSNumber *ts = JABuildTimestamp(warn);
         if (ts) JASet(vc, @"currentTimeStamp", ts);
