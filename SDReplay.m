@@ -63,46 +63,10 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <stdarg.h>
-#include <stdio.h>
 
 // ---------- 日志（只为确认时间戳校验和定位是否发出） ----------
 // 只写 2~3 行、单次调用、不在任何循环或高频回调里，不会拖住主线程。
 // （历史上出问题的是"每次回调都 fopen 写"，那种必须避免。）
-
-static void JALogReset(void) {
-    @autoreleasepool {
-        NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        if (!dir) return;
-        NSString *path = [dir stringByAppendingPathComponent:@"jl_sd.log"];
-        FILE *fp = fopen(path.UTF8String, "w");
-        if (fp) fclose(fp);
-    }
-}
-
-static void JALog(NSString *fmt, ...) {
-    @autoreleasepool {
-        va_list ap;
-        va_start(ap, fmt);
-        NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
-        va_end(ap);
-        NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        if (!dir) return;
-        NSString *path = [dir stringByAppendingPathComponent:@"jl_sd.log"];
-        FILE *fp = fopen(path.UTF8String, "a");
-        if (fp) {
-            fprintf(fp, "%s\n", s.UTF8String);
-            fclose(fp);
-        }
-    }
-}
-
-// 自进程启动首次调用起的耗时（秒），用于日志对齐时序
-static double JAElapsed(void) {
-    static NSTimeInterval t0 = 0;
-    if (t0 == 0) t0 = [NSDate timeIntervalSinceReferenceDate];
-    return [NSDate timeIntervalSinceReferenceDate] - t0;
-}
 
 // ---------- KVC 工具 ----------
 
@@ -260,11 +224,6 @@ static BOOL JASecValid(long long v) { return v >= JA_SEC_MIN && v < JA_SEC_MAX; 
 //         ② eventTimeUTC（字符串直接取秒，NSNumber 原样）
 //         ③ event_date + event_time 拼本地秒
 static NSNumber *JABuildTimestamp(id warn) {
-    JALog(@"TS 候选 url=%@ | utc=%@ | date=%@ | time=%@",
-          JAVal(warn, @"event_file_url"),
-          JAVal(warn, @"eventTimeUTC"),
-          JAVal(warn, @"event_date"),
-          JAVal(warn, @"event_time"));
 
     // ① event_file_url 文件名内嵌秒：xxx/2310111541-1792304458.jpg
     id url = JAVal(warn, @"event_file_url");
@@ -277,11 +236,9 @@ static NSNumber *JABuildTimestamp(id warn) {
         if (m && m.numberOfRanges > 1) {
             long long v = [[u substringWithRange:[m rangeAtIndex:1]] longLongValue];
             if (JASecValid(v)) {
-                JALog(@"TS 采用① url 秒=%lld", v);
                 return @(v);
             }
             // 命中桶名 APPID（如 -1326615813.）→ 丢弃，交给下一级
-            JALog(@"TS 拒绝① url 秒=%lld（超出 2020~2035）", v);
         }
     }
     // ② eventTimeUTC
@@ -294,10 +251,8 @@ static NSNumber *JABuildTimestamp(id warn) {
             v = (long long)[t doubleValue]; // 秒字符串（不再 ×1000）
         }
         if (JASecValid(v)) {
-            JALog(@"TS 采用② eventTimeUTC=%lld", v);
             return @(v);
         }
-        JALog(@"TS 拒绝② eventTimeUTC=%lld（原始值=%@）", v, t);
     }
     // ③ event_date + event_time 拼秒（本地时区）
     NSString *d = JAVal(warn, @"event_date");
@@ -312,15 +267,11 @@ static NSNumber *JABuildTimestamp(id warn) {
         if (date) {
             long long v = (long long)[date timeIntervalSince1970];
             if (JASecValid(v)) {
-                JALog(@"TS 采用③ %@ %@ → %lld", d, tm, v);
                 return @(v);
             }
-            JALog(@"TS 拒绝③ %@ %@ → %lld", d, tm, v);
         } else {
-            JALog(@"TS ③ 日期解析失败 d=%@ t=%@", d, tm);
         }
     }
-    JALog(@"TS 全部来源无效，无法定位");
     return nil;
 }
 
@@ -349,8 +300,6 @@ static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
-static void JADumpSD(id vc, NSString *tag);
-// v1.73：条件等待 + 定点补发（定义在 viewDidAppear 之后，这里前置声明）
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
 static id g_activeSDPlayer = nil;
@@ -433,21 +382,6 @@ static IMP g_orig_handleJumpToOpenCloud = NULL;
 // 3.0s stopSDPlay（停官方自动流）→ switchToSDDay 切报警日 → 2.5s 定位 → 1.5s 时间轴。
 // 官方自动流的短暂显示（读取进度/实时）是官方 viewDidLoad 固有行为，定位成功后
 // 画面即切到报警时间；三段"乱跳"观感保留，换取定位 100% 可靠。
-// 【v1.78 定案：完全回到原版的时序，只保留时间戳校验】
-//
-// 一路试错后确认的事实：
-//   · 原版 v1.32（3.0s 停流 → 切日 → 2.5s 定位）在同环境下，第 5 台 NVR
-//     也是「很快就跳到定位时间出画面」。用户亲自对比过。
-//   · 我删掉 stopSDPlay（v1.75）之后，第 5 台就一直灰屏/回实时。
-//   原因很直接：官方 viewDidLoad 起的自动实时流还在跑，我们这条定位流是第二条，
-//   两条流各带一套渲染层 → 画面抢不到、表现为灰屏；过一会官方自动流赢了 → 回实时。
-//   原版之所以快且稳，就是因为它先把自动流停掉，保证只有一条流。
-//   v1.73 那个错误不是「stop 有害」，而是「stop 太早（0.8s）」——那时官方 SD 初始化
-//   还没建好，被拆断后数据就废了。3.0s 停流才是原版的正确时机。
-//
-// 所以这里逐字恢复原版：3.0s stopSDPlay → switchToSDDay → 重设 camera 选中日
-//   → 2.5s startSDPlayWithSelectTimeStamp → 1.5s 拨时间轴。
-// 唯一保留的额外改动是时间戳 2020~2035 校验（修监控1）和时间轴视图树兜底。
 static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (g_orig_rtc_vda) ((void(*)(id, SEL))g_orig_rtc_vda)(self, _cmd);
     if (self != g_activeSDPlayer) return;
@@ -458,19 +392,18 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-        // v1.21：先停官方 viewDidLoad 自动起的流（保证单流，避免双流并存交替渲染）。
-        // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门导致的
-        // "第二次起偶发定位不生效/播最新"。
-        JADumpSD(self, @"stop前(+3.0s)");
+        // v1.21：先停官方 viewDidLoad 自动起的流（避免双流并存交替渲染），再建定位流。
+        // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门（0x103429ee0 bit0）
+        // 导致的"第二次起偶发定位不生效/播最新"。
         SEL st = NSSelectorFromString(@"stopSDPlay");
         if ([self respondsToSelector:st]) {
             ((void(*)(id, SEL))objc_msgSend)(self, st);
-            JALog(@"3.0s stopSDPlay（停官方自动流，保证单流）");
         }
-        JADumpSD(self, @"stop后");
-        // v1.25 定案：官方"选日期"正规入口 = switchToSDDay:dateString:
-        // （x2=报警日0点秒 long long，x3=日期字符串），内部触发该日事件加载 +
-        // 刷新时间轴 + 顶部日期显示（跨天修正）。
+        // v1.25 定案（v1.24 运行时枚举 + 反汇编 0x100afb2e8）：官方"选日期"正规入口 =
+        // switchToSDDay:dateString:（x2=报警日0点秒 long long，x3=日期字符串）。
+        // 内部：算时间范围 → 设选中日/日期串/时间区间 → 经 viewModel 转发触发
+        // 加载该日事件 + 刷新时间轴 + 顶部日期显示（跨天修正：官方默认选中"今日"，
+        // 过了 12 点打开昨天报警会卡 00:00、看不到昨天进度条）。
         long long dayStart = JADayStartSec(@(sec));
         if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
         NSDateFormatter *df = [[NSDateFormatter alloc] init];
@@ -480,32 +413,22 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         if ([self respondsToSelector:sw]) {
             ((void(*)(id, SEL, long long, id))objc_msgSend)(self, sw, dayStart, ds);
         }
-        // 官方 viewDidLoad 会把 myCamera.sdSelectiontDay 覆盖成"今日0点"（跨天场景），
+        // 官方 viewDidLoad 会把 myCamera.sdSelectiontDay 覆盖成"今日0点"（跨天场景 = 10-20），
         // 时间轴/相对秒若读它就会算错。这里重设回报警日0点。
         @try {
             [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
         } @catch (NSException *e) {}
-        // 事件列表加载是异步的（网络拉取），等 2.5s 后再建流定位（原版 v1.28 定值）。
+        // 事件列表加载是异步的（网络拉取），等 2.5s 后再建流定位。
+        // v1.28：1.5s→2.5s —— switchToSDDay 切日（尤其跨天场景 10-19）后官方要重新
+        // 网络拉取该日事件列表，网络稍慢时 1.5s 内列表未到 → startSDPlay 定位时官方
+        // 找不到该时间点录像 → 偶发"当前时间无录像"。
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            JADumpSD(self, @"定位前(+5.5s)");
             SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:s]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
-                JALog(@"定位 startSDPlay=%lld", sec);
             }
-            JADumpSD(self, @"定位刚发出");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (self != g_activeSDPlayer) return;
-                JADumpSD(self, @"定位后+0.8s");
-            });
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (self != g_activeSDPlayer) return;
-                JADumpSD(self, @"定位后+2.5s");
-            });
             // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到报警时间点
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
@@ -514,57 +437,6 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             });
         });
     });
-}
-
-// ============ v1.73 追加：条件等待 + 定点补发 ============
-// 设计目标（对应用户实测现象）：
-//   · 有的设备 1 秒内数据就到，死等 2.5s 是浪费 → 就绪立刻走
-//   · 有的设备要 4 秒才进 SD 模式（日志"等待 4 轮"）→ 死等 2.5s 不够，会判无录像
-//   · 同一条报警连点三次才成功 → 说明单次定位可能被官方吞掉，需要一次补发
-// 所以：不用固定时间，用「目标日数据就绪」作为条件；定位后再用 isEnterSDPlay 判断
-// 是否真的进去了，没进去才补一次（限 1 次，避免反复重建流导致花屏）。
-
-
-// 在视图树里找时间轴（NVR 多通道布局下 VC 的 timeLineView 可能为 nil）
-static id JAFindTimeLineInView(UIView *root, NSInteger depth) {
-    if (!root || depth > 12) return nil;
-    Class tlCls = NSClassFromString(@"JATimeLineView");
-    if (tlCls && [root isKindOfClass:tlCls]) return root;
-    for (UIView *v in root.subviews) {
-        id r = JAFindTimeLineInView(v, depth + 1);
-        if (r) return r;
-    }
-    return nil;
-}
-
-// 【v1.79 纯诊断，不改任何播放行为】
-// 第 5 台反复失败，但原版在同一台设备上能成功，说明差异藏在运行时状态里，
-// 不在我改的那几行延时上。这组函数只读取、只打日志，一次点击约 12~15 行，
-// 一次性把播放器内部状态拍下来。
-static NSString *JAS(id obj, NSString *k) {
-    if (!obj) return @"nil";
-    id v = nil;
-    @try { v = [obj valueForKey:k]; } @catch (__unused NSException *e) { return @"ERR"; }
-    return v ? [NSString stringWithFormat:@"%@", v] : @"nil";
-}
-
-static void JADumpSD(id vc, NSString *tag) {
-    if (!vc) return;
-    id vm = nil, tl = nil, cam = nil;
-    @try { vm = [vc valueForKey:@"viewModel"]; } @catch (__unused NSException *e) {}
-    @try { tl = [vc valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
-    @try { cam = [vc valueForKey:@"myCamera"]; } @catch (__unused NSException *e) {}
-    NSString *tlDesc = tl ? NSStringFromClass([tl class]) : @"nil";
-    long long tlDay = 0, tlSec = 0;
-    @try { tlDay = [[tl valueForKey:@"sdSelectiontDay"] longLongValue]; } @catch (__unused NSException *e) {}
-    @try { tlSec = [[tl valueForKey:@"currentSec"] longLongValue]; } @catch (__unused NSException *e) {}
-    JALog(@"[%@] VC curTS=%@ selDay=%@ | CAM uid=%@ day=%@ | VM enterSD=%@ session=%@ ctrl=%@ seek=%@ | TL=%@ tlDay=%lld tlSec=%lld",
-          tag,
-          JAS(vc, @"currentTimeStamp"), JAS(vc, @"currentSelectedSDDay"),
-          JAS(cam, @"uid"), JAS(cam, @"sdSelectiontDay"),
-          JAS(vm, @"isEnterSDPlay"), JAS(vm, @"isSessionConnected"),
-          JAS(vm, @"sdplayControl"), JAS(vm, @"isSeekingPlay"),
-          tlDesc, tlDay, tlSec);
 }
 
 // v1.18：把官方时间轴指示器/滚动位置/时间标签同步到指定秒。
@@ -585,21 +457,11 @@ static void JATimeLineSyncToSec(id sdVC, long long sec) {
 
         id tl = nil;
         @try { tl = [sdVC valueForKey:@"timeLineView"]; }
-        @catch (NSException *e) {}
-        // 【v1.76】NVR 多通道布局下 timeLineView 可能为 nil（第 5 台实测时间轴停在
-        // 00:00:00 就是没拿到这个对象）。改用视图树兜底找 JATimeLineView 实例。
-        if (!tl) {
-            UIView *root = nil;
-            @try { root = [sdVC valueForKey:@"view"]; }
-            @catch (__unused NSException *e) {}
-            if (root) tl = JAFindTimeLineInView(root, 0);
-            JALog(@"时间轴 VC 属性为 nil，视图树兜底: %@", tl ? NSStringFromClass([tl class]) : @"未找到");
-        }
+        @catch (NSException *e) { return; }
         if (!tl) return;
         SEL c = NSSelectorFromString(@"changeCurrentTimeStamp:");
         if ([tl respondsToSelector:c]) {
             ((void(*)(id, SEL, long long))objc_msgSend)(tl, c, rel);
-            JALog(@"拨时间轴 rel=%lld", rel);
         }
     }
 }
@@ -721,8 +583,6 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALogReset();
-    JALog(@"=== v1.79 (v1.32 原版 + 时间戳校验 + 诊断) loaded ===");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
