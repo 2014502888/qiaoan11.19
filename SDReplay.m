@@ -353,7 +353,6 @@ static void JATimeLineSyncToSec(id sdVC, long long sec);
 static void JAPollReady(id sdVC, long long sec, unsigned long long gen, int attempt);
 static void JADoLocateLite(id sdVC, long long sec, unsigned long long gen);
 static BOOL JASDReady(id sdVC);
-static BOOL JAReadyForDay(id sdVC, long long dayStart);
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
 static id g_activeSDPlayer = nil;
@@ -512,44 +511,6 @@ static BOOL JASDReady(id sdVC) {
     return NO;
 }
 
-// 静默取事件秒（轮询专用：每 0.3s 调一次，绝不能写日志，否则就是高频落盘）
-// 逻辑与 JABuildTimestamp 一致，只是不记日志。
-static long long JAEventSecSilent(id ev) {
-    if (!ev) return 0;
-    id url = JAVal(ev, @"event_file_url");
-    if ([url isKindOfClass:NSString.class]) {
-        NSString *u = url;
-        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"-(\\d{10})\\."
-                                                                            options:0 error:nil];
-        NSTextCheckingResult *m = [re firstMatchInString:u options:0 range:NSMakeRange(0, u.length)];
-        if (m && m.numberOfRanges > 1) {
-            long long v = [[u substringWithRange:[m rangeAtIndex:1]] longLongValue];
-            if (JASecValid(v)) return v;
-        }
-    }
-    id t = JAVal(ev, @"eventTimeUTC");
-    if (t) {
-        long long v = 0;
-        if ([t isKindOfClass:NSNumber.class]) v = [t longLongValue];
-        else if ([t isKindOfClass:NSString.class]) v = (long long)[t doubleValue];
-        if (JASecValid(v)) return v;
-    }
-    NSString *d = JAVal(ev, @"event_date");
-    NSString *tm = JAVal(ev, @"event_time");
-    if (d.length && tm.length) {
-        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-        fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-        fmt.timeZone = [NSTimeZone localTimeZone];
-        NSDate *dt = [fmt dateFromString:[NSString stringWithFormat:@"%@ %@", d, tm]];
-        if (dt) {
-            long long v = (long long)[dt timeIntervalSince1970];
-            if (JASecValid(v)) return v;
-        }
-    }
-    return 0;
-}
-
 // 在视图树里找时间轴（NVR 多通道布局下 VC 的 timeLineView 可能为 nil）
 static id JAFindTimeLineInView(UIView *root, NSInteger depth) {
     if (!root || depth > 12) return nil;
@@ -562,59 +523,29 @@ static id JAFindTimeLineInView(UIView *root, NSInteger depth) {
     return nil;
 }
 
-// 【v1.76 关键修正】目标日数据是否就绪，只看「事件列表里有没有目标日的事件」。
+// 【v1.77】不再轮询「就绪」。
 //
-// v1.73~v1.75 的判据要求 timeLineView.sdSelectiontDay == 目标日，第 5 台监控
-// （WLC9GD4US69JTBCF1111A，NVR 多通道）连 25 轮（7.5s）都满足不了 —— 日志
-// 「等待就绪超时(25 轮)」，紧接着时间轴显示 00:00:00，说明它根本没有可用的
-// timeLineView（或它一直没被初始化）。把一个「可能为 nil 的对象」当成必须条件，
-// 结果就是永远不就绪、永远走保底、永远失败。
+// 证据（v1.76 日志，第 5 台 WLC9GD4US69JTBCF1111A）：
+//   等待就绪超时(25 轮) → 保底定位
+//   定位后 1.5s: isEnterSDPlay=1      ← 保底定位其实成功了
+//   拨时间轴 rel=27241                ← 时间轴也拨到了 07:34:01
+// 也就是说：这次定位是成功的，只是硬等了 25 轮（7.5s）才发出去 —— 用户看到的就是
+// 「进去先灰屏七八秒」。
+// 原因：这台是 NVR 多通道，sdRecordFileArr（报警事件列表）一直是空的或不属于目标日，
+// 而「事件列表」根本不代表「录像能不能用」—— 两会事。原版从不做任何判断、固定
+// 2.5s 就发定位，同一台设备照样成功，正好证明这一点。
 //
-// 现在改成纯看事件数据本身：从 sdRecordFileArr 里抽查首条与末条事件的秒，
-// 只要有一条落在目标日，就说明该日数据已经到了。时间轴只负责"显示"，
-// 不再参与"是否就绪"的判断。
-static BOOL JAReadyForDay(id sdVC, long long dayStart) {
-    NSArray *arr = nil;
-    @try { arr = [sdVC valueForKey:@"sdRecordFileArr"]; }
-    @catch (__unused NSException *e) {}
-    if (![arr isKindOfClass:NSArray.class] || arr.count == 0) return NO;
-
-    long long s1 = JAEventSecSilent(arr.firstObject);
-    long long s2 = JAEventSecSilent(arr.lastObject);
-    long long end = dayStart + 86400LL;
-    if (s1 >= dayStart && s1 < end) return YES;
-    if (s2 >= dayStart && s2 < end) return YES;
-    return NO;
-}
-
-// 轮询：0.3s 一次，最多 25 次（约 7.5s），就绪立刻定位；超时保底也定位（不能干等）
+// 所以回到原版的「无条件固定节奏」，只把时间压缩：
+//   0.8s 切日 → 2.2s 定位（原版是 3.0s + 2.5s = 5.5s）
+// 快的设备不受影响（它们本来就 1 秒内到位），慢的设备也不会被一个永远为假的判据卡住。
 static void JAPollReady(id sdVC, long long sec, unsigned long long gen, int attempt) {
+    (void)attempt;
     if (sdVC != g_activeSDPlayer || gen != g_rtcVdaGen) return;
-    long long dayStart = JADayStartSec(@(sec));
-    if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
-
-    if (JAReadyForDay(sdVC, dayStart)) {
-        JALog(@"目标日数据就绪(第 %d 轮) → 定位 (+%.3fs)", attempt, JAElapsed());
-        JADoLocateLite(sdVC, sec, gen);
-        return;
-    }
-    if (attempt >= 25) {
-        JALog(@"等待就绪超时(%d 轮) → 保底定位", attempt);
-        // 保底前把选中日再写一遍，防止官方把日期回写成"今天"导致保底也定位错日
-        @try { [sdVC setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"]; }
-        @catch (__unused NSException *e) {}
-        id tl = nil;
-        @try { tl = [sdVC valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
-        if (tl) {
-            @try { [tl setValue:@(dayStart) forKey:@"sdSelectiontDay"]; }
-            @catch (__unused NSException *e) {}
-        }
-        JADoLocateLite(sdVC, sec, gen);
-        return;
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+    JALog(@"切日完成 → 2.2s 后定位（不做就绪判断）");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        JAPollReady(sdVC, sec, gen, attempt + 1);
+        if (sdVC != g_activeSDPlayer || gen != g_rtcVdaGen) return;
+        JADoLocateLite(sdVC, sec, gen);
     });
 }
 
@@ -802,7 +733,7 @@ static void JAHook(void) {
 __attribute__((constructor))
 static void JASDReplayInit(void) {
     JALogReset();
-    JALog(@"=== v1.76 (v1.32 原版 + 时间戳校验 + 事件就绪) loaded ===");
+    JALog(@"=== v1.77 (v1.32 原版 + 时间戳校验) loaded ===");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
