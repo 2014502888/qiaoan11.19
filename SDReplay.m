@@ -314,7 +314,35 @@ static long long g_rtcTargetSec = 0; // 报警时间戳（秒），viewDidAppear
 // v1.20：viewDidAppear 世代去重（官方可能多次触发 → 只保留最后一次的 3.0s 定位）
 static unsigned long long g_rtcVdaGen = 0;
 
+// v1.83：清理残留 SD 状态。
+// 实测现象：同一台 NVR，有时第一次就成，有时连点好几次都不成（聚集性）。
+// 原因：一次定位失败后官方 viewModel 的 isEnterSDPlay / sdplayControl 停在中间值，
+// 下一次 startSDPlayWithSelectTimeStamp: 的前置预检查直接失败 → 又失败 → 再失败，
+// 形成"越点越不行"。官方自己提供了重置入口 setIsEnterSDPlayToNO（VM 方法），
+// 每次退出/进入前清一次，避免脏状态续到下一次。
+static void JAResetSDModelState(id vc) {
+    if (!vc) return;
+    SEL st = NSSelectorFromString(@"stopSDPlay");
+    if ([vc respondsToSelector:st]) {
+        ((void(*)(id, SEL))objc_msgSend)(vc, st);
+    }
+    id vm = nil;
+    @try { vm = [vc valueForKey:@"viewModel"]; }
+    @catch (__unused NSException *e) { return; }
+    if (!vm) return;
+    SEL no = NSSelectorFromString(@"setIsEnterSDPlayToNO");
+    if ([vm respondsToSelector:no]) {
+        ((void(*)(id, SEL))objc_msgSend)(vm, no);
+    }
+}
+
 static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
+    // v1.83：上一次的播放器若还没退出（用户连点时），先把它停流并清状态，
+    // 避免新 VC 建流时撞上旧 VC 的残留会话。
+    if (g_activeSDPlayer) {
+        JAResetSDModelState(g_activeSDPlayer);
+        g_activeSDPlayer = nil;
+    }
     // 目标界面 = 官方本地 SD 回放 JANewRtcSDPlayViewController（RTC 完整播放器，
     // 时间轴/日历/SD 卡检测/播放控制；用户手动进本地回放看到的就是它）。
     Class cls = NSClassFromString(@"JANewRtcSDPlayViewController");
@@ -573,10 +601,8 @@ static void ja_rtc_viewDidDisappear(id self, SEL _cmd) {
     g_activeSDPlayer = nil;  // 先清标记：后续 viewDidAppear/定位闭包不再执行
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        SEL st = NSSelectorFromString(@"stopSDPlay");
-        if ([self respondsToSelector:st]) {
-            ((void(*)(id, SEL))objc_msgSend)(self, st);
-        }
+        // v1.83：停流之外，再清一次 viewModel 的 SD 状态（isEnterSDPlay/sdplayControl）
+        JAResetSDModelState(self);
     });
 }
 
