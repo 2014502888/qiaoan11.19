@@ -349,6 +349,7 @@ static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
+static void JADumpSD(id vc, NSString *tag);
 // v1.73：条件等待 + 定点补发（定义在 viewDidAppear 之后，这里前置声明）
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
@@ -460,11 +461,13 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         // v1.21：先停官方 viewDidLoad 自动起的流（保证单流，避免双流并存交替渲染）。
         // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门导致的
         // "第二次起偶发定位不生效/播最新"。
+        JADumpSD(self, @"stop前(+3.0s)");
         SEL st = NSSelectorFromString(@"stopSDPlay");
         if ([self respondsToSelector:st]) {
             ((void(*)(id, SEL))objc_msgSend)(self, st);
             JALog(@"3.0s stopSDPlay（停官方自动流，保证单流）");
         }
+        JADumpSD(self, @"stop后");
         // v1.25 定案：官方"选日期"正规入口 = switchToSDDay:dateString:
         // （x2=报警日0点秒 long long，x3=日期字符串），内部触发该日事件加载 +
         // 刷新时间轴 + 顶部日期显示（跨天修正）。
@@ -486,11 +489,23 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+            JADumpSD(self, @"定位前(+5.5s)");
             SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:s]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
                 JALog(@"定位 startSDPlay=%lld", sec);
             }
+            JADumpSD(self, @"定位刚发出");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (self != g_activeSDPlayer) return;
+                JADumpSD(self, @"定位后+0.8s");
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (self != g_activeSDPlayer) return;
+                JADumpSD(self, @"定位后+2.5s");
+            });
             // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到报警时间点
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
@@ -520,6 +535,36 @@ static id JAFindTimeLineInView(UIView *root, NSInteger depth) {
         if (r) return r;
     }
     return nil;
+}
+
+// 【v1.79 纯诊断，不改任何播放行为】
+// 第 5 台反复失败，但原版在同一台设备上能成功，说明差异藏在运行时状态里，
+// 不在我改的那几行延时上。这组函数只读取、只打日志，一次点击约 12~15 行，
+// 一次性把播放器内部状态拍下来。
+static NSString *JAS(id obj, NSString *k) {
+    if (!obj) return @"nil";
+    id v = nil;
+    @try { v = [obj valueForKey:k]; } @catch (__unused NSException *e) { return @"ERR"; }
+    return v ? [NSString stringWithFormat:@"%@", v] : @"nil";
+}
+
+static void JADumpSD(id vc, NSString *tag) {
+    if (!vc) return;
+    id vm = nil, tl = nil, cam = nil;
+    @try { vm = [vc valueForKey:@"viewModel"]; } @catch (__unused NSException *e) {}
+    @try { tl = [vc valueForKey:@"timeLineView"]; } @catch (__unused NSException *e) {}
+    @try { cam = [vc valueForKey:@"myCamera"]; } @catch (__unused NSException *e) {}
+    NSString *tlDesc = tl ? NSStringFromClass([tl class]) : @"nil";
+    long long tlDay = 0, tlSec = 0;
+    @try { tlDay = [[tl valueForKey:@"sdSelectiontDay"] longLongValue]; } @catch (__unused NSException *e) {}
+    @try { tlSec = [[tl valueForKey:@"currentSec"] longLongValue]; } @catch (__unused NSException *e) {}
+    JALog(@"[%@] VC curTS=%@ selDay=%@ | CAM uid=%@ day=%@ | VM enterSD=%@ session=%@ ctrl=%@ seek=%@ | TL=%@ tlDay=%lld tlSec=%lld",
+          tag,
+          JAS(vc, @"currentTimeStamp"), JAS(vc, @"currentSelectedSDDay"),
+          JAS(cam, @"uid"), JAS(cam, @"sdSelectiontDay"),
+          JAS(vm, @"isEnterSDPlay"), JAS(vm, @"isSessionConnected"),
+          JAS(vm, @"sdplayControl"), JAS(vm, @"isSeekingPlay"),
+          tlDesc, tlDay, tlSec);
 }
 
 // v1.18：把官方时间轴指示器/滚动位置/时间标签同步到指定秒。
@@ -677,7 +722,7 @@ static void JAHook(void) {
 __attribute__((constructor))
 static void JASDReplayInit(void) {
     JALogReset();
-    JALog(@"=== v1.78 (v1.32 原版 + 时间戳校验) loaded ===");
+    JALog(@"=== v1.79 (v1.32 原版 + 时间戳校验 + 诊断) loaded ===");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
