@@ -1,6 +1,22 @@
 // JoolinkSDReplay — 乔安智联 报警消息 → 直达本地 SD 卡录像
-// 本文件 = v1.32 原版（4.4.67 验收通过）全文 + 唯一一处追加（v1.70），其余一字未动。
+// 本文件 = v1.32 原版（4.4.67 验收通过）全文 + 两处追加，其余一字未动：
+//   ① v1.70：等 isEnterSDPlay 就绪后补 seekTo（定位那一步）
+//   ② v1.71：时间戳 2020~2035 范围校验（监控1 COS 桶名 APPID 被当成录像秒的问题）
 //
+// ===== v1.71（本版）是真正修监控1 的那一处 =====
+//   现象：只有监控1 不行，提示"当前时间无录像"，其他监控都正常。
+//   日志铁证：点监控1 的报警，定位发出的秒是 1326615813（2012 年），
+//   而正确值应该是 1795xxxxxx（2026 年）。
+//   来源：监控1 录像在腾讯 COS，URL 形如
+//     https://qiaoan-video-3days-1326615813.cos.ap-nanjing.myqcloud.com/…/xxx-1795…jpg
+//   桶名里就嵌着 -1326615813.（腾讯云 APPID）。原版正则 @"-(\d{10})\." 从头匹配，
+//   先命中桶名 → 把 APPID 当成录像秒 → 定位到 2012 年 → 官方查不到该时间录像。
+//   其他监控走华为 OBS，桶名不带数字，所以同一份代码在它们身上正常。
+//   v1.34 就修过这个（加 2020~2035 校验），后来我整份回退到 v1.32 原版时把它丢了，
+//   监控1 于是又回到"无录像"。本版把它叠回来：三级候选（url 秒 / eventTimeUTC /
+//   日期+时间）逐级校验，不合法就丢掉换下一级。
+//
+// 其余保留原版历史说明：
 // v1.26（清理版）：移除日志系统（jasdreplay.log）、v1.17 首帧确认 hook
 // （respDeviceFirstFrameTimeStamp: 官方链不触发，挂空无用）、JADumpWarnInfo 诊断。
 // v1.27：修正 JADayStartSec 公式 —— 旧实现"UTC当日0点-28800"在北京凌晨 0~8 点
@@ -227,11 +243,32 @@ static id JAFindCamera(UIViewController *detailVC, id warn, NSString **src) {
 
 // ---------- 时间戳 ----------
 
+// 【v1.71 监控1 修复 —— 这一段是 v1.34 的改动，原版 v1.32 缺的就是它】
+// 时间戳合理区间：2020-01-01 ~ 2035-01-01
+// 监控1 的录像走腾讯 COS，URL 形如：
+//   https://qiaoan-video-3days-1326615813.cos.ap-nanjing.myqcloud.com/.../xxx-1795xxxxxx.jpg
+// 桶名里就带 -1326615813.（这是腾讯云的 APPID）。原版正则 @"-(\d{10})\." 会先命中
+// 桶名那一段，把 1326615813（2012 年）当成录像秒 → 定位到十几年前 → 官方判
+// "当前时间无录像" → 回实时。其他监控走华为 OBS（桶名不带数字），所以不受影响，
+// 于是现象就是"只有监控1 不行、其他都正常"。
+// 修法：每一级候选（url 秒 / eventTimeUTC / date+time）都过一遍范围校验，
+// 不合法就丢弃、继续用下一级，绝不把明显不是录像时间的值拿去定位。
+#define JA_SEC_MIN 1577836800LL   // 2020-01-01 00:00 (UTC+8)
+#define JA_SEC_MAX 2051222400LL   // 2035-01-01 00:00 (UTC+8)
+
+static BOOL JASecValid(long long v) { return v >= JA_SEC_MIN && v < JA_SEC_MAX; }
+
 // 报警事件时间戳：秒（NSNumber）
 // 优先级：① event_file_url 文件名内嵌秒（服务器权威，如 -1792304458.jpg）
 //         ② eventTimeUTC（字符串直接取秒，NSNumber 原样）
 //         ③ event_date + event_time 拼本地秒
 static NSNumber *JABuildTimestamp(id warn) {
+    JALog(@"TS 候选 url=%@ | utc=%@ | date=%@ | time=%@",
+          JAVal(warn, @"event_file_url"),
+          JAVal(warn, @"eventTimeUTC"),
+          JAVal(warn, @"event_date"),
+          JAVal(warn, @"event_time"));
+
     // ① event_file_url 文件名内嵌秒：xxx/2310111541-1792304458.jpg
     id url = JAVal(warn, @"event_file_url");
     if ([url isKindOfClass:NSString.class]) {
@@ -241,20 +278,29 @@ static NSNumber *JABuildTimestamp(id warn) {
         NSTextCheckingResult *m = [re firstMatchInString:u options:0
                                                    range:NSMakeRange(0, u.length)];
         if (m && m.numberOfRanges > 1) {
-            NSString *sec = [u substringWithRange:[m rangeAtIndex:1]];
-            return @(sec.longLongValue);
+            long long v = [[u substringWithRange:[m rangeAtIndex:1]] longLongValue];
+            if (JASecValid(v)) {
+                JALog(@"TS 采用① url 秒=%lld", v);
+                return @(v);
+            }
+            // 命中桶名 APPID（如 -1326615813.）→ 丢弃，交给下一级
+            JALog(@"TS 拒绝① url 秒=%lld（超出 2020~2035）", v);
         }
     }
     // ② eventTimeUTC
     id t = JAVal(warn, @"eventTimeUTC");
     if (t) {
+        long long v = 0;
         if ([t isKindOfClass:NSNumber.class]) {
-            return t; // 原样（秒）
+            v = [t longLongValue];
+        } else if ([t isKindOfClass:NSString.class]) {
+            v = (long long)[t doubleValue]; // 秒字符串（不再 ×1000）
         }
-        if ([t isKindOfClass:NSString.class]) {
-            return @((long long)[t doubleValue]); // 秒字符串（不再 ×1000）
+        if (JASecValid(v)) {
+            JALog(@"TS 采用② eventTimeUTC=%lld", v);
+            return @(v);
         }
-        return nil;
+        JALog(@"TS 拒绝② eventTimeUTC=%lld（原始值=%@）", v, t);
     }
     // ③ event_date + event_time 拼秒（本地时区）
     NSString *d = JAVal(warn, @"event_date");
@@ -267,9 +313,17 @@ static NSNumber *JABuildTimestamp(id warn) {
         fmt.timeZone = [NSTimeZone localTimeZone];
         NSDate *date = [fmt dateFromString:s];
         if (date) {
-            return @((long long)[date timeIntervalSince1970]);
+            long long v = (long long)[date timeIntervalSince1970];
+            if (JASecValid(v)) {
+                JALog(@"TS 采用③ %@ %@ → %lld", d, tm, v);
+                return @(v);
+            }
+            JALog(@"TS 拒绝③ %@ %@ → %lld", d, tm, v);
+        } else {
+            JALog(@"TS ③ 日期解析失败 d=%@ t=%@", d, tm);
         }
     }
+    JALog(@"TS 全部来源无效，无法定位");
     return nil;
 }
 
@@ -429,7 +483,7 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:s]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
-                JALog(@"v1.70 点火 startSDPlayWithSelectTimeStamp=%lld", sec);
+                JALog(@"v1.71 点火 startSDPlayWithSelectTimeStamp=%lld", sec);
             }
             // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到报警时间点。
             // v1.70：改成先等 SD 模式就绪，再补 seekTo（监控1 球机只点火不定位的原因）。
@@ -468,12 +522,12 @@ static BOOL JASDReady(id sdVC) {
 static void JASeekWhenReady(id sdVC, long long sec, int attempt) {
     if (sdVC != g_activeSDPlayer) return;
     if (attempt > 4) {
-        JALog(@"v1.70 SD 模式迟迟未就绪，放弃 seek，仅拨时间轴");
+        JALog(@"v1.71 SD 模式迟迟未就绪，放弃 seek，仅拨时间轴");
         JATimeLineSyncToSec(sdVC, sec);
         return;
     }
     if (!JASDReady(sdVC)) {
-        JALog(@"v1.70 等待 SD 模式就绪… 第 %d 轮", attempt + 1);
+        JALog(@"v1.71 等待 SD 模式就绪… 第 %d 轮", attempt + 1);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             JASeekWhenReady(sdVC, sec, attempt + 1);
@@ -482,15 +536,15 @@ static void JASeekWhenReady(id sdVC, long long sec, int attempt) {
     }
     SEL st = NSSelectorFromString(@"seekTo:duration:");
     if (![sdVC respondsToSelector:st]) {
-        JALog(@"v1.70 seekTo:duration: 不存在，跳过");
+        JALog(@"v1.71 seekTo:duration: 不存在，跳过");
         JATimeLineSyncToSec(sdVC, sec);
         return;
     }
     @try {
         ((void(*)(id, SEL, long long, double))objc_msgSend)(sdVC, st, sec, 0.0);
-        JALog(@"v1.70 seekTo 绝对秒=%lld duration=0 已发出", sec);
+        JALog(@"v1.71 seekTo 绝对秒=%lld duration=0 已发出", sec);
     } @catch (NSException *e) {
-        JALog(@"v1.70 seekTo 异常: %@", e.reason);
+        JALog(@"v1.71 seekTo 异常: %@", e.reason);
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -644,7 +698,7 @@ static void JAHook(void) {
 __attribute__((constructor))
 static void JASDReplayInit(void) {
     JALogReset();
-    JALog(@"=== v1.70 (v1.32 原版 + seekTo) loaded ===");
+    JALog(@"=== v1.71 (v1.32 原版 + seekTo + 时间戳校验) loaded ===");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
