@@ -350,9 +350,6 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
 // v1.73：条件等待 + 定点补发（定义在 viewDidAppear 之后，这里前置声明）
-static void JAPollReady(id sdVC, long long sec, unsigned long long gen, int attempt);
-static void JADoLocateLite(id sdVC, long long sec, unsigned long long gen);
-static BOOL JASDReady(id sdVC);
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
 static id g_activeSDPlayer = nil;
@@ -435,6 +432,21 @@ static IMP g_orig_handleJumpToOpenCloud = NULL;
 // 3.0s stopSDPlay（停官方自动流）→ switchToSDDay 切报警日 → 2.5s 定位 → 1.5s 时间轴。
 // 官方自动流的短暂显示（读取进度/实时）是官方 viewDidLoad 固有行为，定位成功后
 // 画面即切到报警时间；三段"乱跳"观感保留，换取定位 100% 可靠。
+// 【v1.78 定案：完全回到原版的时序，只保留时间戳校验】
+//
+// 一路试错后确认的事实：
+//   · 原版 v1.32（3.0s 停流 → 切日 → 2.5s 定位）在同环境下，第 5 台 NVR
+//     也是「很快就跳到定位时间出画面」。用户亲自对比过。
+//   · 我删掉 stopSDPlay（v1.75）之后，第 5 台就一直灰屏/回实时。
+//   原因很直接：官方 viewDidLoad 起的自动实时流还在跑，我们这条定位流是第二条，
+//   两条流各带一套渲染层 → 画面抢不到、表现为灰屏；过一会官方自动流赢了 → 回实时。
+//   原版之所以快且稳，就是因为它先把自动流停掉，保证只有一条流。
+//   v1.73 那个错误不是「stop 有害」，而是「stop 太早（0.8s）」——那时官方 SD 初始化
+//   还没建好，被拆断后数据就废了。3.0s 停流才是原版的正确时机。
+//
+// 所以这里逐字恢复原版：3.0s stopSDPlay → switchToSDDay → 重设 camera 选中日
+//   → 2.5s startSDPlayWithSelectTimeStamp → 1.5s 拨时间轴。
+// 唯一保留的额外改动是时间戳 2020~2035 校验（修监控1）和时间轴视图树兜底。
 static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (g_orig_rtc_vda) ((void(*)(id, SEL))g_orig_rtc_vda)(self, _cmd);
     if (self != g_activeSDPlayer) return;
@@ -442,31 +454,20 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (sec < 1000000000LL) return;
     // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
     unsigned long long myGen = ++g_rtcVdaGen;
-    // 【v1.73】切日提前到 0.8s（原版 3.0s）。v1.65 在 4.4.79 上实测 0.8s 切日可行
-    // （切日后事件 87 条、camera 日期没被官方回写）。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-        // 【v1.75 关键修正】这里不再调 stopSDPlay。
-        //
-        // v1.73 我把原版 3.0s 的 stop 挪到了 0.8s，直接造成"第 5 台监控加载超时/灰屏"。
-        // 原因：官方 viewDidLoad 之后还要做一整套 SD 初始化 —— 建立 SD 会话、读 SD 卡
-        // 状态、拉取当日录像索引，不同设备耗时差别极大（快的 1s 内，慢的要 3~4s）。
-        // 在 0.8s 就 stopSDPlay，等于在它还没建好 SD 会话时把流拆掉：
-        //   · 初始化快的设备（前 4 台）：拆的时候已经建完，无所谓 → 照常秒出画面
-        //   · 初始化慢的设备（第 5 台 WLC9GD4US69JTBCF1111A）：会话被拆断 → 录像索引
-        //     永远拉不全 → 轮询 15 轮都拿不到就绪 → 之后强制定位 → 官方加载失败 →
-        //     灰屏 +「加载超时，点击重新播放」→ 过一会退回实时
-        // 原版 v1.32 是 3.0s 才 stop，那时所有设备都初始化完了，所以从没这个现象。
-        //
-        // v1.65 的做法同样是「不 stop、只切日」，在 4.4.79 上跑通过。stop 原本是
-        // 4.4.67 时代为了消"双流交替渲染"加的，现在改成"等就绪再定位"，不需要它。
-        //
-        // v1.25 定案（v1.24 运行时枚举 + 反汇编 0x100afb2e8）：官方"选日期"正规入口 =
-        // switchToSDDay:dateString:（x2=报警日0点秒 long long，x3=日期字符串）。
-        // 内部：算时间范围 → 设选中日/日期串/时间区间 → 经 viewModel 转发触发
-        // 加载该日事件 + 刷新时间轴 + 顶部日期显示（跨天修正：官方默认选中"今日"，
-        // 过了 12 点打开昨天报警会卡 00:00、看不到昨天进度条）。
+        // v1.21：先停官方 viewDidLoad 自动起的流（保证单流，避免双流并存交替渲染）。
+        // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门导致的
+        // "第二次起偶发定位不生效/播最新"。
+        SEL st = NSSelectorFromString(@"stopSDPlay");
+        if ([self respondsToSelector:st]) {
+            ((void(*)(id, SEL))objc_msgSend)(self, st);
+            JALog(@"3.0s stopSDPlay（停官方自动流，保证单流）");
+        }
+        // v1.25 定案：官方"选日期"正规入口 = switchToSDDay:dateString:
+        // （x2=报警日0点秒 long long，x3=日期字符串），内部触发该日事件加载 +
+        // 刷新时间轴 + 顶部日期显示（跨天修正）。
         long long dayStart = JADayStartSec(@(sec));
         if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
         NSDateFormatter *df = [[NSDateFormatter alloc] init];
@@ -476,16 +477,27 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         if ([self respondsToSelector:sw]) {
             ((void(*)(id, SEL, long long, id))objc_msgSend)(self, sw, dayStart, ds);
         }
-        // 官方 viewDidLoad 会把 myCamera.sdSelectiontDay 覆盖成"今日0点"（跨天场景 = 10-20），
+        // 官方 viewDidLoad 会把 myCamera.sdSelectiontDay 覆盖成"今日0点"（跨天场景），
         // 时间轴/相对秒若读它就会算错。这里重设回报警日0点。
         @try {
             [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
         } @catch (NSException *e) {}
-        // 【v1.73】不再固定死等 2.5s。原版那 2.5s 就是在等该日事件列表网络拉取，
-        // 但设备之间差别很大：快的 1s 内、慢的（实测一台）要 4s 才就绪。
-        // 固定值两头都不对 —— 快的是浪费、慢的是不够（不够就会出现"当前时间无录像"）。
-        // 改为 0.3s 轮询：目标日数据一到位立刻定位。
-        JAPollReady(self, sec, myGen, 0);
+        // 事件列表加载是异步的（网络拉取），等 2.5s 后再建流定位（原版 v1.28 定值）。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+            SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+            if ([self respondsToSelector:s]) {
+                ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
+                JALog(@"定位 startSDPlay=%lld", sec);
+            }
+            // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到报警时间点
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                JATimeLineSyncToSec(self, sec);
+            });
+        });
     });
 }
 
@@ -497,19 +509,6 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
 // 所以：不用固定时间，用「目标日数据就绪」作为条件；定位后再用 isEnterSDPlay 判断
 // 是否真的进去了，没进去才补一次（限 1 次，避免反复重建流导致花屏）。
 
-// 官方是否真的进入了 SD 播放模式（定位是否被官方接受）。
-// 只能在 startSDPlayWithSelectTimeStamp: 之后用；在它之前官方还没建 SD 流，值必然是 NO。
-static BOOL JASDReady(id sdVC) {
-    id vm = nil;
-    @try { vm = [sdVC valueForKey:@"viewModel"]; }
-    @catch (NSException *e) { return NO; }
-    if (!vm) return NO;
-    id v = nil;
-    @try { v = [vm valueForKey:@"isEnterSDPlay"]; }
-    @catch (NSException *e) { return NO; }
-    if ([v isKindOfClass:NSNumber.class]) return [v boolValue];
-    return NO;
-}
 
 // 在视图树里找时间轴（NVR 多通道布局下 VC 的 timeLineView 可能为 nil）
 static id JAFindTimeLineInView(UIView *root, NSInteger depth) {
@@ -521,61 +520,6 @@ static id JAFindTimeLineInView(UIView *root, NSInteger depth) {
         if (r) return r;
     }
     return nil;
-}
-
-// 【v1.77】不再轮询「就绪」。
-//
-// 证据（v1.76 日志，第 5 台 WLC9GD4US69JTBCF1111A）：
-//   等待就绪超时(25 轮) → 保底定位
-//   定位后 1.5s: isEnterSDPlay=1      ← 保底定位其实成功了
-//   拨时间轴 rel=27241                ← 时间轴也拨到了 07:34:01
-// 也就是说：这次定位是成功的，只是硬等了 25 轮（7.5s）才发出去 —— 用户看到的就是
-// 「进去先灰屏七八秒」。
-// 原因：这台是 NVR 多通道，sdRecordFileArr（报警事件列表）一直是空的或不属于目标日，
-// 而「事件列表」根本不代表「录像能不能用」—— 两会事。原版从不做任何判断、固定
-// 2.5s 就发定位，同一台设备照样成功，正好证明这一点。
-//
-// 所以回到原版的「无条件固定节奏」，只把时间压缩：
-//   0.8s 切日 → 2.2s 定位（原版是 3.0s + 2.5s = 5.5s）
-// 快的设备不受影响（它们本来就 1 秒内到位），慢的设备也不会被一个永远为假的判据卡住。
-static void JAPollReady(id sdVC, long long sec, unsigned long long gen, int attempt) {
-    (void)attempt;
-    if (sdVC != g_activeSDPlayer || gen != g_rtcVdaGen) return;
-    JALog(@"切日完成 → 2.2s 后定位（不做就绪判断）");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (sdVC != g_activeSDPlayer || gen != g_rtcVdaGen) return;
-        JADoLocateLite(sdVC, sec, gen);
-    });
-}
-
-// 发定位；之后只观测状态、拨时间轴，不再重复建流。
-// 【v1.74 关键】撤掉 v1.73 的「1.5s 未进 SD 就补发」。
-// 实测后果：官方正在拉该段录像时是灰屏加载态，此时 isEnterSDPlay 仍为 0；
-// 补发会重建流、直接打断官方这次加载 → 官方弹「加载超时，点击重新播放」，
-// 界面卡在灰屏、过一会回退到实时。日志里 WLC9GD4US69JTBCF1111A 三次连续
-// 「未进 SD 模式 → 补发第 2 次」，正好对上这个现象。
-// 正确做法：等就绪再定位（下方轮询），定位后不再动手；真要重试就让用户重进，
-// 那等于重建整个 VC（v1.71 手动多点几次能成功，就是这个道理）。
-static void JADoLocateLite(id sdVC, long long sec, unsigned long long gen) {
-    if (sdVC != g_activeSDPlayer || gen != g_rtcVdaGen) return;
-    SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-    if ([sdVC respondsToSelector:s]) {
-        @try {
-            ((void(*)(id, SEL, long long))objc_msgSend)(sdVC, s, sec);
-            JALog(@"定位 startSDPlay=%lld (+%.3fs)", sec, JAElapsed());
-        } @catch (NSException *e) {
-            JALog(@"定位异常: %@", e.reason);
-        }
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (sdVC != g_activeSDPlayer || gen != g_rtcVdaGen) return;
-        // 只记录，不干预：官方此时可能正在加载（灰屏），任何重建流都会打断它
-        JALog(@"定位后 1.5s: isEnterSDPlay=%d（0=仍在加载或未进入，不动它）",
-              JASDReady(sdVC));
-        JATimeLineSyncToSec(sdVC, sec);
-    });
 }
 
 // v1.18：把官方时间轴指示器/滚动位置/时间标签同步到指定秒。
@@ -733,7 +677,7 @@ static void JAHook(void) {
 __attribute__((constructor))
 static void JASDReplayInit(void) {
     JALogReset();
-    JALog(@"=== v1.77 (v1.32 原版 + 时间戳校验) loaded ===");
+    JALog(@"=== v1.78 (v1.32 原版 + 时间戳校验) loaded ===");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
