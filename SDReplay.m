@@ -1,6 +1,10 @@
 // JoolinkSDReplay — 乔安智联 报警消息 → 直达本地 SD 卡录像
-// 本文件 = v1.32 原版（4.4.67 验收通过）全文 + 一处追加，其余一字未动：
+// 本文件 = v1.32 原版（4.4.67 验收通过）全文 + 两处追加，其余一字未动：
 //   ② v1.71：时间戳 2020~2035 范围校验（监控1 COS 桶名 APPID 被当成录像秒的问题）
+//   ③ v1.81：时间轴拨动后校验 currentSec + 最多 2 次重拨（首次进入指针不定位）
+// v1.82 清理：删除日志系统（JALog/JALogReset/stdarg/stdio）、删除
+//   handleJumpToOpenCloud 纯转发 hook（hook 后原样转调原本，等于没做），
+//   播放时序与 hook 行为完全不变。
 //
 // ===== v1.71（本版）是真正修监控1 的那一处 =====
 //   现象：只有监控1 不行，提示"当前时间无录像"，其他监控都正常。
@@ -63,40 +67,10 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <stdarg.h>
-#include <stdio.h>
 
 // ---------- 日志（只为确认时间戳校验和定位是否发出） ----------
 // 只写 2~3 行、单次调用、不在任何循环或高频回调里，不会拖住主线程。
 // （历史上出问题的是"每次回调都 fopen 写"，那种必须避免。）
-
-// ---------- 极简日志（只记时间轴同步结果，不参与任何播放逻辑） ----------
-static void JALogReset(void) {
-    @autoreleasepool {
-        NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        if (!dir) return;
-        NSString *path = [dir stringByAppendingPathComponent:@"jl_sd.log"];
-        FILE *fp = fopen(path.UTF8String, "w");
-        if (fp) fclose(fp);
-    }
-}
-
-static void JALog(NSString *fmt, ...) {
-    @autoreleasepool {
-        va_list ap;
-        va_start(ap, fmt);
-        NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
-        va_end(ap);
-        NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        if (!dir) return;
-        NSString *path = [dir stringByAppendingPathComponent:@"jl_sd.log"];
-        FILE *fp = fopen(path.UTF8String, "a");
-        if (fp) {
-            fprintf(fp, "%s\n", s.UTF8String);
-            fclose(fp);
-        }
-    }
-}
 
 // ---------- KVC 工具 ----------
 
@@ -392,8 +366,6 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
 // ---------- hook 实现（C IMP，无类依赖） ----------
 
 static IMP g_orig_clickCloudRecordAction = NULL;
-static IMP g_orig_handleJumpToOpenCloud = NULL;
-
 // v1.15 核心：JANewRtcSDPlayViewController viewDidAppear（官方本地 SD 回放界面）
 // 官方 viewDidLoad/setupData 已自动：setMyCamera 到 sharedInstance、setIsSDPlayer:YES、
 // 建 viewModel、按 myCamera.sdSelectiontDay 设选中日、加载事件列表。
@@ -514,7 +486,6 @@ static void JATimeLineSyncTry(id sdVC, long long sec, int retry) {
     SEL c = NSSelectorFromString(@"changeCurrentTimeStamp:");
     if (![tl respondsToSelector:c]) return;
     ((void(*)(id, SEL, long long))objc_msgSend)(tl, c, rel);
-    JALog(@"拨时间轴 rel=%lld (拨前=%lld, retry=%d)", rel, before, retry);
 
     __weak id weakVC = sdVC;
     __weak id weakTL = tl;
@@ -527,10 +498,8 @@ static void JATimeLineSyncTry(id sdVC, long long sec, int retry) {
         @try { after = [[strongTL valueForKey:@"currentSec"] longLongValue]; }
         @catch (__unused NSException *e) {}
         if (after >= rel - 2 && after <= rel + 2) {
-            JALog(@"时间轴到位 %lld（目标 %lld）", after, rel);
             return;
         }
-        JALog(@"时间轴未到位 %lld（目标 %lld），剩余重试 %d", after, rel, retry);
         if (retry > 0) JATimeLineSyncTry(strongVC, sec, retry - 1);
     });
 }
@@ -592,12 +561,6 @@ static void ja_clickCloudRecordAction(id self, SEL _cmd, id sender) {
     });
 }
 
-// 原 selector：handleJumpToOpenCloud —— 不再拦截，转发原实现
-static void ja_handleJumpToOpenCloud(id self, SEL _cmd) {
-    if (g_orig_handleJumpToOpenCloud) {
-        ((void(*)(id, SEL))g_orig_handleJumpToOpenCloud)(self, _cmd);
-    }
-}
 
 // v1.30：viewDidDisappear 后 0.3s 停流 —— 用户按返回时官方不主动停流，SD 回放流
 // 继续在后台拉数据（状态栏流量一直跑），官方还会把"播放中"状态持久化，导致下次
@@ -637,8 +600,6 @@ static void JAHook(void) {
         if (detailCls) {
             JASetImp(detailCls, @selector(clickCloudRecordAction:), (IMP)ja_clickCloudRecordAction,
                      &g_orig_clickCloudRecordAction);
-            JASetImp(detailCls, @selector(handleJumpToOpenCloud), (IMP)ja_handleJumpToOpenCloud,
-                     &g_orig_handleJumpToOpenCloud);
             JAHooked = YES;
         }
     }
@@ -657,8 +618,6 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALogReset();
-    JALog(@"=== v1.81 (原版 + 时间戳校验 + 时间轴到位校验) loaded ===");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
