@@ -351,7 +351,7 @@ static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
 // v1.73：条件等待 + 定点补发（定义在 viewDidAppear 之后，这里前置声明）
 static void JAPollReady(id sdVC, long long sec, unsigned long long gen, int attempt);
-static void JADoLocateLite(id sdVC, long long sec, unsigned long long gen, int retry);
+static void JADoLocateLite(id sdVC, long long sec, unsigned long long gen);
 static BOOL JASDReady(id sdVC);
 static BOOL JAReadyForDay(id sdVC, long long dayStart);
 
@@ -524,7 +524,7 @@ static BOOL JAReadyForDay(id sdVC, long long dayStart) {
     return tlDay == dayStart;
 }
 
-// 轮询：0.3s 一次，最多 15 次（约 4.5s），就绪立刻定位；超时保底也定位（不能干等）
+// 轮询：0.3s 一次，最多 25 次（约 7.5s），就绪立刻定位；超时保底也定位（不能干等）
 static void JAPollReady(id sdVC, long long sec, unsigned long long gen, int attempt) {
     if (sdVC != g_activeSDPlayer || gen != g_rtcVdaGen) return;
     long long dayStart = JADayStartSec(@(sec));
@@ -532,10 +532,10 @@ static void JAPollReady(id sdVC, long long sec, unsigned long long gen, int atte
 
     if (JAReadyForDay(sdVC, dayStart)) {
         JALog(@"目标日数据就绪(第 %d 轮) → 定位 (+%.3fs)", attempt, JAElapsed());
-        JADoLocateLite(sdVC, sec, gen, 0);
+        JADoLocateLite(sdVC, sec, gen);
         return;
     }
-    if (attempt >= 15) {
+    if (attempt >= 25) {
         JALog(@"等待就绪超时(%d 轮) → 保底定位", attempt);
         // 保底前把选中日再写一遍，防止官方把日期回写成"今天"导致保底也定位错日
         @try { [sdVC setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"]; }
@@ -546,7 +546,7 @@ static void JAPollReady(id sdVC, long long sec, unsigned long long gen, int atte
             @try { [tl setValue:@(dayStart) forKey:@"sdSelectiontDay"]; }
             @catch (__unused NSException *e) {}
         }
-        JADoLocateLite(sdVC, sec, gen, 0);
+        JADoLocateLite(sdVC, sec, gen);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
@@ -555,14 +555,21 @@ static void JAPollReady(id sdVC, long long sec, unsigned long long gen, int atte
     });
 }
 
-// 发定位 + 1.5s 后检查是否真的进了 SD 模式；没进就补一次（retry<1），否则拨时间轴。
-static void JADoLocateLite(id sdVC, long long sec, unsigned long long gen, int retry) {
+// 发定位；之后只观测状态、拨时间轴，不再重复建流。
+// 【v1.74 关键】撤掉 v1.73 的「1.5s 未进 SD 就补发」。
+// 实测后果：官方正在拉该段录像时是灰屏加载态，此时 isEnterSDPlay 仍为 0；
+// 补发会重建流、直接打断官方这次加载 → 官方弹「加载超时，点击重新播放」，
+// 界面卡在灰屏、过一会回退到实时。日志里 WLC9GD4US69JTBCF1111A 三次连续
+// 「未进 SD 模式 → 补发第 2 次」，正好对上这个现象。
+// 正确做法：等就绪再定位（下方轮询），定位后不再动手；真要重试就让用户重进，
+// 那等于重建整个 VC（v1.71 手动多点几次能成功，就是这个道理）。
+static void JADoLocateLite(id sdVC, long long sec, unsigned long long gen) {
     if (sdVC != g_activeSDPlayer || gen != g_rtcVdaGen) return;
     SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
     if ([sdVC respondsToSelector:s]) {
         @try {
             ((void(*)(id, SEL, long long))objc_msgSend)(sdVC, s, sec);
-            JALog(@"定位 startSDPlay=%lld（第 %d 次）", sec, retry + 1);
+            JALog(@"定位 startSDPlay=%lld (+%.3fs)", sec, JAElapsed());
         } @catch (NSException *e) {
             JALog(@"定位异常: %@", e.reason);
         }
@@ -570,11 +577,9 @@ static void JADoLocateLite(id sdVC, long long sec, unsigned long long gen, int r
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (sdVC != g_activeSDPlayer || gen != g_rtcVdaGen) return;
-        if (!JASDReady(sdVC) && retry < 1) {
-            JALog(@"1.5s 后仍未进 SD 模式 → 补发第 %d 次", retry + 2);
-            JADoLocateLite(sdVC, sec, gen, retry + 1);
-            return;
-        }
+        // 只记录，不干预：官方此时可能正在加载（灰屏），任何重建流都会打断它
+        JALog(@"定位后 1.5s: isEnterSDPlay=%d（0=仍在加载或未进入，不动它）",
+              JASDReady(sdVC));
         JATimeLineSyncToSec(sdVC, sec);
     });
 }
@@ -724,7 +729,7 @@ static void JAHook(void) {
 __attribute__((constructor))
 static void JASDReplayInit(void) {
     JALogReset();
-    JALog(@"=== v1.73 (v1.32 原版 + 时间戳校验 + 就绪轮询) loaded ===");
+    JALog(@"=== v1.74 (v1.32 原版 + 时间戳校验 + 就绪轮询) loaded ===");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
