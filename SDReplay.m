@@ -63,10 +63,40 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <stdarg.h>
+#include <stdio.h>
 
 // ---------- 日志（只为确认时间戳校验和定位是否发出） ----------
 // 只写 2~3 行、单次调用、不在任何循环或高频回调里，不会拖住主线程。
 // （历史上出问题的是"每次回调都 fopen 写"，那种必须避免。）
+
+// ---------- 极简日志（只记时间轴同步结果，不参与任何播放逻辑） ----------
+static void JALogReset(void) {
+    @autoreleasepool {
+        NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (!dir) return;
+        NSString *path = [dir stringByAppendingPathComponent:@"jl_sd.log"];
+        FILE *fp = fopen(path.UTF8String, "w");
+        if (fp) fclose(fp);
+    }
+}
+
+static void JALog(NSString *fmt, ...) {
+    @autoreleasepool {
+        va_list ap;
+        va_start(ap, fmt);
+        NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+        va_end(ap);
+        NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (!dir) return;
+        NSString *path = [dir stringByAppendingPathComponent:@"jl_sd.log"];
+        FILE *fp = fopen(path.UTF8String, "a");
+        if (fp) {
+            fprintf(fp, "%s\n", s.UTF8String);
+            fclose(fp);
+        }
+    }
+}
 
 // ---------- KVC 工具 ----------
 
@@ -447,23 +477,67 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
 // 不是绝对 Unix 秒！绝对秒 1792407777 → 官方按 秒/3600 算小时 → 显示 497891:02:57。
 // 修正：相对秒 = 报警秒 - 报警日0点（JADayStartSec 纯计算，跨天后官方会把
 // myCamera.sdSelectiontDay 覆盖成今日0点，读 ivar 会算错 → 必须用计算值）。
-static void JATimeLineSyncToSec(id sdVC, long long sec) {
-    @autoreleasepool {
-        long long dayStart = JADayStartSec(@(sec));
-        if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
-        long long rel = sec - dayStart;   // 报警日相对秒 0~86399
-        if (rel < 0) rel = 0;
-        if (rel > 86399) rel = 86399;
+static void JATimeLineSyncTry(id sdVC, long long sec, int retry);
 
-        id tl = nil;
-        @try { tl = [sdVC valueForKey:@"timeLineView"]; }
-        @catch (NSException *e) { return; }
-        if (!tl) return;
-        SEL c = NSSelectorFromString(@"changeCurrentTimeStamp:");
-        if ([tl respondsToSelector:c]) {
-            ((void(*)(id, SEL, long long))objc_msgSend)(tl, c, rel);
+// 拨一次并在 0.35s 后核对 currentSec 是否真的到位；没到位且还有重试次数就再拨。
+// 为什么需要重试：首次进入页面时 JATimeLineView 的 reload 是异步的，我们拨完指针后
+// 它 reload 收尾会把 currentSec 重置回原值（实测日志 第一次 tlSec 保持 50892 不变，
+// 第二次进入时时间轴已稳定，一拨就变成 27269）。所以只拨一次天然不可靠。
+// 该动作只动时间轴指示器/滚动/时间标签，不触发 startSDPlay，不影响播放。
+static void JATimeLineSyncTry(id sdVC, long long sec, int retry) {
+    long long dayStart = JADayStartSec(@(sec));
+    if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
+    long long rel = sec - dayStart;
+    if (rel < 0) rel = 0;
+    if (rel > 86399) rel = 86399;
+
+    id tl = nil;
+    @try { tl = [sdVC valueForKey:@"timeLineView"]; }
+    @catch (__unused NSException *e) { return; }
+    if (!tl) {
+        // 时间轴对象还没创建（懒加载 getter 返回 nil）→ 稍后再来
+        if (retry > 0) {
+            __weak id weakVC = sdVC;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                id strongVC = weakVC;
+                if (strongVC) JATimeLineSyncTry(strongVC, sec, retry - 1);
+            });
         }
+        return;
     }
+
+    long long before = 0;
+    @try { before = [[tl valueForKey:@"currentSec"] longLongValue]; }
+    @catch (__unused NSException *e) {}
+
+    SEL c = NSSelectorFromString(@"changeCurrentTimeStamp:");
+    if (![tl respondsToSelector:c]) return;
+    ((void(*)(id, SEL, long long))objc_msgSend)(tl, c, rel);
+    JALog(@"拨时间轴 rel=%lld (拨前=%lld, retry=%d)", rel, before, retry);
+
+    __weak id weakVC = sdVC;
+    __weak id weakTL = tl;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        id strongTL = weakTL;
+        id strongVC = weakVC;
+        if (!strongTL || !strongVC) return;
+        long long after = 0;
+        @try { after = [[strongTL valueForKey:@"currentSec"] longLongValue]; }
+        @catch (__unused NSException *e) {}
+        if (after >= rel - 2 && after <= rel + 2) {
+            JALog(@"时间轴到位 %lld（目标 %lld）", after, rel);
+            return;
+        }
+        JALog(@"时间轴未到位 %lld（目标 %lld），剩余重试 %d", after, rel, retry);
+        if (retry > 0) JATimeLineSyncTry(strongVC, sec, retry - 1);
+    });
+}
+
+static void JATimeLineSyncToSec(id sdVC, long long sec) {
+    // 最多拨 3 次（首次 + 2 次重试），总跨度约 1.4s；够了就停，不做无限重试。
+    JATimeLineSyncTry(sdVC, sec, 2);
 }
 
 // 防抖：同一详情页实例 2 秒内只 push 一次（官方可能触发两次点击事件 → 双 push 闪烁）
@@ -583,6 +657,8 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
+    JALogReset();
+    JALog(@"=== v1.81 (原版 + 时间戳校验 + 时间轴到位校验) loaded ===");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
