@@ -448,13 +448,21 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-        // v1.21：先停官方 viewDidLoad 自动起的流（避免双流并存交替渲染），再建定位流。
-        // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门（0x103429ee0 bit0）
-        // 导致的"第二次起偶发定位不生效/播最新"。
-        SEL st = NSSelectorFromString(@"stopSDPlay");
-        if ([self respondsToSelector:st]) {
-            ((void(*)(id, SEL))objc_msgSend)(self, st);
-        }
+        // 【v1.75 关键修正】这里不再调 stopSDPlay。
+        //
+        // v1.73 我把原版 3.0s 的 stop 挪到了 0.8s，直接造成"第 5 台监控加载超时/灰屏"。
+        // 原因：官方 viewDidLoad 之后还要做一整套 SD 初始化 —— 建立 SD 会话、读 SD 卡
+        // 状态、拉取当日录像索引，不同设备耗时差别极大（快的 1s 内，慢的要 3~4s）。
+        // 在 0.8s 就 stopSDPlay，等于在它还没建好 SD 会话时把流拆掉：
+        //   · 初始化快的设备（前 4 台）：拆的时候已经建完，无所谓 → 照常秒出画面
+        //   · 初始化慢的设备（第 5 台 WLC9GD4US69JTBCF1111A）：会话被拆断 → 录像索引
+        //     永远拉不全 → 轮询 15 轮都拿不到就绪 → 之后强制定位 → 官方加载失败 →
+        //     灰屏 +「加载超时，点击重新播放」→ 过一会退回实时
+        // 原版 v1.32 是 3.0s 才 stop，那时所有设备都初始化完了，所以从没这个现象。
+        //
+        // v1.65 的做法同样是「不 stop、只切日」，在 4.4.79 上跑通过。stop 原本是
+        // 4.4.67 时代为了消"双流交替渲染"加的，现在改成"等就绪再定位"，不需要它。
+        //
         // v1.25 定案（v1.24 运行时枚举 + 反汇编 0x100afb2e8）：官方"选日期"正规入口 =
         // switchToSDDay:dateString:（x2=报警日0点秒 long long，x3=日期字符串）。
         // 内部：算时间范围 → 设选中日/日期串/时间区间 → 经 viewModel 转发触发
@@ -729,7 +737,7 @@ static void JAHook(void) {
 __attribute__((constructor))
 static void JASDReplayInit(void) {
     JALogReset();
-    JALog(@"=== v1.74 (v1.32 原版 + 时间戳校验 + 就绪轮询) loaded ===");
+    JALog(@"=== v1.75 (v1.32 原版 + 时间戳校验 + 就绪轮询) loaded ===");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
