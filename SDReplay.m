@@ -512,24 +512,79 @@ static BOOL JASDReady(id sdVC) {
     return NO;
 }
 
-// 目标日数据是否就绪：时间轴选中日已切到报警日，且事件列表非空。
-// 两个条件都要：只看事件非空会把「昨天残留的数据」当成就绪（v1.64 踩过）；
-// 只看日期会把还没拉到数据的空列表当成就绪。
+// 静默取事件秒（轮询专用：每 0.3s 调一次，绝不能写日志，否则就是高频落盘）
+// 逻辑与 JABuildTimestamp 一致，只是不记日志。
+static long long JAEventSecSilent(id ev) {
+    if (!ev) return 0;
+    id url = JAVal(ev, @"event_file_url");
+    if ([url isKindOfClass:NSString.class]) {
+        NSString *u = url;
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"-(\\d{10})\\."
+                                                                            options:0 error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:u options:0 range:NSMakeRange(0, u.length)];
+        if (m && m.numberOfRanges > 1) {
+            long long v = [[u substringWithRange:[m rangeAtIndex:1]] longLongValue];
+            if (JASecValid(v)) return v;
+        }
+    }
+    id t = JAVal(ev, @"eventTimeUTC");
+    if (t) {
+        long long v = 0;
+        if ([t isKindOfClass:NSNumber.class]) v = [t longLongValue];
+        else if ([t isKindOfClass:NSString.class]) v = (long long)[t doubleValue];
+        if (JASecValid(v)) return v;
+    }
+    NSString *d = JAVal(ev, @"event_date");
+    NSString *tm = JAVal(ev, @"event_time");
+    if (d.length && tm.length) {
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+        fmt.timeZone = [NSTimeZone localTimeZone];
+        NSDate *dt = [fmt dateFromString:[NSString stringWithFormat:@"%@ %@", d, tm]];
+        if (dt) {
+            long long v = (long long)[dt timeIntervalSince1970];
+            if (JASecValid(v)) return v;
+        }
+    }
+    return 0;
+}
+
+// 在视图树里找时间轴（NVR 多通道布局下 VC 的 timeLineView 可能为 nil）
+static id JAFindTimeLineInView(UIView *root, NSInteger depth) {
+    if (!root || depth > 12) return nil;
+    Class tlCls = NSClassFromString(@"JATimeLineView");
+    if (tlCls && [root isKindOfClass:tlCls]) return root;
+    for (UIView *v in root.subviews) {
+        id r = JAFindTimeLineInView(v, depth + 1);
+        if (r) return r;
+    }
+    return nil;
+}
+
+// 【v1.76 关键修正】目标日数据是否就绪，只看「事件列表里有没有目标日的事件」。
+//
+// v1.73~v1.75 的判据要求 timeLineView.sdSelectiontDay == 目标日，第 5 台监控
+// （WLC9GD4US69JTBCF1111A，NVR 多通道）连 25 轮（7.5s）都满足不了 —— 日志
+// 「等待就绪超时(25 轮)」，紧接着时间轴显示 00:00:00，说明它根本没有可用的
+// timeLineView（或它一直没被初始化）。把一个「可能为 nil 的对象」当成必须条件，
+// 结果就是永远不就绪、永远走保底、永远失败。
+//
+// 现在改成纯看事件数据本身：从 sdRecordFileArr 里抽查首条与末条事件的秒，
+// 只要有一条落在目标日，就说明该日数据已经到了。时间轴只负责"显示"，
+// 不再参与"是否就绪"的判断。
 static BOOL JAReadyForDay(id sdVC, long long dayStart) {
     NSArray *arr = nil;
     @try { arr = [sdVC valueForKey:@"sdRecordFileArr"]; }
     @catch (__unused NSException *e) {}
     if (![arr isKindOfClass:NSArray.class] || arr.count == 0) return NO;
 
-    id tl = nil;
-    @try { tl = [sdVC valueForKey:@"timeLineView"]; }
-    @catch (__unused NSException *e) {}
-    if (!tl) return NO;
-    id d = nil;
-    @try { d = [tl valueForKey:@"sdSelectiontDay"]; }
-    @catch (__unused NSException *e) {}
-    long long tlDay = d ? [d longLongValue] : 0;
-    return tlDay == dayStart;
+    long long s1 = JAEventSecSilent(arr.firstObject);
+    long long s2 = JAEventSecSilent(arr.lastObject);
+    long long end = dayStart + 86400LL;
+    if (s1 >= dayStart && s1 < end) return YES;
+    if (s2 >= dayStart && s2 < end) return YES;
+    return NO;
 }
 
 // 轮询：0.3s 一次，最多 25 次（约 7.5s），就绪立刻定位；超时保底也定位（不能干等）
@@ -610,11 +665,21 @@ static void JATimeLineSyncToSec(id sdVC, long long sec) {
 
         id tl = nil;
         @try { tl = [sdVC valueForKey:@"timeLineView"]; }
-        @catch (NSException *e) { return; }
+        @catch (NSException *e) {}
+        // 【v1.76】NVR 多通道布局下 timeLineView 可能为 nil（第 5 台实测时间轴停在
+        // 00:00:00 就是没拿到这个对象）。改用视图树兜底找 JATimeLineView 实例。
+        if (!tl) {
+            UIView *root = nil;
+            @try { root = [sdVC valueForKey:@"view"]; }
+            @catch (__unused NSException *e) {}
+            if (root) tl = JAFindTimeLineInView(root, 0);
+            JALog(@"时间轴 VC 属性为 nil，视图树兜底: %@", tl ? NSStringFromClass([tl class]) : @"未找到");
+        }
         if (!tl) return;
         SEL c = NSSelectorFromString(@"changeCurrentTimeStamp:");
         if ([tl respondsToSelector:c]) {
             ((void(*)(id, SEL, long long))objc_msgSend)(tl, c, rel);
+            JALog(@"拨时间轴 rel=%lld", rel);
         }
     }
 }
@@ -737,7 +802,7 @@ static void JAHook(void) {
 __attribute__((constructor))
 static void JASDReplayInit(void) {
     JALogReset();
-    JALog(@"=== v1.75 (v1.32 原版 + 时间戳校验 + 就绪轮询) loaded ===");
+    JALog(@"=== v1.76 (v1.32 原版 + 时间戳校验 + 事件就绪) loaded ===");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
