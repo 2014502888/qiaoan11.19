@@ -1,6 +1,5 @@
 // JoolinkSDReplay — 乔安智联 报警消息 → 直达本地 SD 卡录像
-// 本文件 = v1.32 原版（4.4.67 验收通过）全文 + 两处追加，其余一字未动：
-//   ① v1.70：等 isEnterSDPlay 就绪后补 seekTo（定位那一步）
+// 本文件 = v1.32 原版（4.4.67 验收通过）全文 + 一处追加，其余一字未动：
 //   ② v1.71：时间戳 2020~2035 范围校验（监控1 COS 桶名 APPID 被当成录像秒的问题）
 //
 // ===== v1.71（本版）是真正修监控1 的那一处 =====
@@ -51,24 +50,15 @@
 //   + 重设 myCamera.sdSelectiontDay=报警日0点 → 再 2.5s startSDPlayWithSelectTimeStamp:
 //   （定位报警秒）→ 再 1.5s JATimeLineSyncToSec（拨时间轴指示器/时间标签到报警时间）。
 //
-// v1.70（本版，唯一追加）：
-//   v1.32 在 4.4.67 上验收通过，换到 4.4.79 后出现"其中一台监控（监控1 球机）不能回放"：
-//   画面停在实时，时间轴却已经跳到报警时刻。
-//   原因：startSDPlayWithSelectTimeStamp: 有两条分支 —— isEnterSDPlay 为 NO 时走
-//   "建流/点火"分支，为 YES 时才走 seek 分支。某些设备/通道上它只完成了点火，
-//   并没有把播放流移到报警时刻，画面因此留在实时。
-//   修法：点火发出后，等 viewModel.isEnterSDPlay 变成 1，再补一次 seekTo:duration:
-//   （绝对 Unix 秒，duration 传 0）完成真正的定位，然后照原版 1.5s 节奏拨时间轴。
-//   实测结论（别再走弯路）：
-//     · seekTo:duration: 第一个参数是「绝对 Unix 秒」。它内部把参数原样转发给
-//       startSDPlayWithSelectTimeStamp:，传相对秒会被当成 1970 年某时刻 → 查不到流。
-//     · 判断是否进入 SD 模式，只能用 viewModel.isEnterSDPlay。
-//       currentTimeStamp 是「实时/设备当前时间」，不是播放位置，拿它判会误判；
-//       timeLineView.currentSec 也不行 —— 那是我们自己拨出来的，属于自证。
-//     · changeCurrentTimeStamp: 入参是「当日相对秒」（0~86399），与 seekTo 口径不同。
-//   除上述一处追加外，hook 集合（4 个）、时序（3.0s / 2.5s / 1.5s）、stopSDPlay、
-//   viewDidDisappear 停流、KVC 用法、时间戳构造、防抖全部保持 v1.32 原样，
-//   未加入任何视图压制、额外 hook 或状态改写。
+// v1.70（已撤销）：曾试着在 isEnterSDPlay 就绪后补一次 seekTo。
+//   实测证明这一步没有证据支撑，属于多余的猜测：
+//   v1.32 原版在 4.4.79 上除了监控1 之外，其它设备都能正常定位，说明官方
+//   startSDPlayWithSelectTimeStamp: 本身已经够用；监控1 的问题出在时间戳被
+//   COS 桶名 APPID 污染（见上面 v1.71），跟 seek 一点关系都没有。
+//   而 seekTo 会二次重建流、最多多等 4 秒，白白增加风险。已整段删除。
+//   唯一保留的结论：seekTo:duration: 的第一参数是绝对 Unix 秒；判断是否进入
+//   SD 模式只能用 viewModel.isEnterSDPlay（currentTimeStamp 是设备实时时间，
+//   timeLineView.currentSec 是我们自己拨出来的，都不能当判据）。
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -76,7 +66,7 @@
 #import <stdarg.h>
 #include <stdio.h>
 
-// ---------- 日志（v1.70 追加：只为确认 seek 有没有发出） ----------
+// ---------- 日志（只为确认时间戳校验和定位是否发出） ----------
 // 只写 2~3 行、单次调用、不在任何循环或高频回调里，不会拖住主线程。
 // （历史上出问题的是"每次回调都 fopen 写"，那种必须避免。）
 
@@ -352,8 +342,6 @@ static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
-static void JASeekWhenReady(id sdVC, long long sec, int attempt);   // v1.70
-static BOOL JASDReady(id sdVC);                                     // v1.70
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
 static id g_activeSDPlayer = nil;
@@ -436,7 +424,6 @@ static IMP g_orig_handleJumpToOpenCloud = NULL;
 // 3.0s stopSDPlay（停官方自动流）→ switchToSDDay 切报警日 → 2.5s 定位 → 1.5s 时间轴。
 // 官方自动流的短暂显示（读取进度/实时）是官方 viewDidLoad 固有行为，定位成功后
 // 画面即切到报警时间；三段"乱跳"观感保留，换取定位 100% 可靠。
-// v1.70：2.5s 定位发出后不再直接拨时间轴，改为「等 isEnterSDPlay==1 → 补 seekTo」。
 static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (g_orig_rtc_vda) ((void(*)(id, SEL))g_orig_rtc_vda)(self, _cmd);
     if (self != g_activeSDPlayer) return;
@@ -485,71 +472,13 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
                 JALog(@"v1.71 点火 startSDPlayWithSelectTimeStamp=%lld", sec);
             }
-            // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到报警时间点。
-            // v1.70：改成先等 SD 模式就绪，再补 seekTo（监控1 球机只点火不定位的原因）。
+            // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到报警时间点
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                JASeekWhenReady(self, sec, 0);
+                JATimeLineSyncToSec(self, sec);
             });
         });
-    });
-}
-
-// ---------- v1.70 追加：唯一一处新逻辑 ----------
-
-// 官方是否真的进入了 SD 播放模式。
-// 这是唯一可靠判据：isEnterSDPlay 为 NO 时，startSDPlayWithSelectTimeStamp: 只走
-// 点火分支（建流/播实时），不会 seek 到报警时刻。
-static BOOL JASDReady(id sdVC) {
-    id vm = nil;
-    @try { vm = [sdVC valueForKey:@"viewModel"]; }
-    @catch (NSException *e) { return NO; }
-    if (!vm) return NO;
-    id v = nil;
-    @try { v = [vm valueForKey:@"isEnterSDPlay"]; }
-    @catch (NSException *e) { return NO; }
-    if ([v isKindOfClass:NSNumber.class]) return [v boolValue];
-    return NO;
-}
-
-// 等进入 SD 模式后补一次 seekTo:duration:。
-// · 第一参数：绝对 Unix 秒（内部原样转给 startSDPlayWithSelectTimeStamp:，
-//   传相对秒会被当成 1970 年某时刻 → 查不到流 → 画面留实时）。
-// · 第二参数：播放时长，传 0。
-// · 最多等 4 轮（每轮 1s，共约 4s）；仍不就绪就只拨时间轴、不硬 seek（避免死循环）。
-// · seek 发出后按原版 1.5s 节奏拨时间轴（相对秒，changeCurrentTimeStamp: 口径不同）。
-static void JASeekWhenReady(id sdVC, long long sec, int attempt) {
-    if (sdVC != g_activeSDPlayer) return;
-    if (attempt > 4) {
-        JALog(@"v1.71 SD 模式迟迟未就绪，放弃 seek，仅拨时间轴");
-        JATimeLineSyncToSec(sdVC, sec);
-        return;
-    }
-    if (!JASDReady(sdVC)) {
-        JALog(@"v1.71 等待 SD 模式就绪… 第 %d 轮", attempt + 1);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            JASeekWhenReady(sdVC, sec, attempt + 1);
-        });
-        return;
-    }
-    SEL st = NSSelectorFromString(@"seekTo:duration:");
-    if (![sdVC respondsToSelector:st]) {
-        JALog(@"v1.71 seekTo:duration: 不存在，跳过");
-        JATimeLineSyncToSec(sdVC, sec);
-        return;
-    }
-    @try {
-        ((void(*)(id, SEL, long long, double))objc_msgSend)(sdVC, st, sec, 0.0);
-        JALog(@"v1.71 seekTo 绝对秒=%lld duration=0 已发出", sec);
-    } @catch (NSException *e) {
-        JALog(@"v1.71 seekTo 异常: %@", e.reason);
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (sdVC != g_activeSDPlayer) return;
-        JATimeLineSyncToSec(sdVC, sec);
     });
 }
 
@@ -698,7 +627,7 @@ static void JAHook(void) {
 __attribute__((constructor))
 static void JASDReplayInit(void) {
     JALogReset();
-    JALog(@"=== v1.71 (v1.32 原版 + seekTo + 时间戳校验) loaded ===");
+    JALog(@"=== v1.72 (v1.32 原版 + 时间戳校验) loaded ===");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
